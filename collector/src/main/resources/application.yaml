@@ -1,0 +1,16 @@
+spring:
+  application:
+    name: shiptrack-collector
+  main:
+    web-application-type: none
+
+collector:
+  base-url: ${COLLECTOR_BASE_URL:http://localhost:8080}
+  internal-token: ${INTERNAL_TOKEN:}
+  concurrency: ${COLLECTOR_CONCURRENCY:1}
+  mapping-path: ${MAPPING_PATH:/app/config/status-mappings.yaml}
+
+logging:
+  level:
+    root: INFO
+    com.shiptrack: INFO
