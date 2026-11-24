@@ -9,11 +9,16 @@ API 才会启动；迁移失败时新版本 API 不会拉起。API 运行时只�
 
 ## 1. 前置条件
 
-- Docker Engine 24+ 与 Docker Compose v2（`docker compose version`）
+- **Docker Engine 服务端 28.0.0+** 与 Docker Compose v2（`docker compose version`）
+  - 28.0.0 之前在默认 bridge 下，发布到 `127.0.0.1` 的端口可能被同二层网络的主机访问；
+    本部署依赖回环发布隔离 API，所以低于该版本拒绝上线。
 - 建议 2 核 4 GB 起；镜像构建阶段需要能访问 Maven Central
 - 一个专用部署账号（如 `deploy`），加入 `docker` 组，不要用 root 日常操作
 
 ```bash
+# 校验服务端版本，必须 >= 28.0.0（看 Server 段，不是 Client）
+docker version --format '{{.Server.Version}}'
+
 # 以 deploy 用户执行
 sudo usermod -aG docker deploy
 ```

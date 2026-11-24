@@ -32,10 +32,13 @@ services:
       - ./mysql-init:/docker-entrypoint-initdb.d:ro
     # No host port: the database is reachable only on the compose network.
     healthcheck:
-      # Authenticated query, not mysqladmin ping: ping exits 0 even when the
-      # root password is rejected, which would hide a failed bootstrap. The
-      # socket is used because root is localhost-only and is not granted TCP.
-      test: ["CMD-SHELL", "mysql --protocol=socket -uroot -p\"$$MYSQL_ROOT_PASSWORD\" -e 'SELECT 1' >/dev/null 2>&1"]
+      # TCP + business account, not a root socket probe: during bootstrap the
+      # official image runs its temporary server with networking disabled, so a
+      # socket query would report healthy before the TCP port exists and let
+      # `migrate` connect too early. Using DB_APP_* also proves that the init
+      # script created the runtime account and granted it this schema.
+      # MYSQL_PWD keeps the password out of the process arguments.
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$DB_APP_PASSWORD\" mysql --host=127.0.0.1 --port=3306 --user=\"$$DB_APP_USER\" --database=\"$$MYSQL_DATABASE\" -e 'SELECT 1' >/dev/null 2>&1"]
       interval: 10s
       timeout: 5s
       retries: 12
