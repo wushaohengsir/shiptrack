@@ -1,0 +1,132 @@
+package com.shiptrack.collector.api;
+
+import com.shiptrack.contract.dto.Eta;
+import com.shiptrack.contract.enums.AttemptStatus;
+import com.shiptrack.contract.enums.EtaPrecision;
+import com.shiptrack.contract.enums.TrackedMilestone;
+import com.shiptrack.contract.enums.TransportStatus;
+import com.shiptrack.contract.internal.TrackingResultReport;
+import com.shiptrack.contract.internal.TrackingResultResponse;
+import com.shiptrack.contract.internal.TrackingRunDto;
+import com.shiptrack.contract.internal.TrackingTaskClaimResponse;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class InternalApiClientTest {
+
+    private HttpServer server;
+    private final AtomicReference<String> token = new AtomicReference<>();
+    private final AtomicReference<String> claimBody = new AtomicReference<>();
+    private final AtomicReference<String> reportBody = new AtomicReference<>();
+
+    private InternalApiClient client;
+
+    @BeforeEach
+    void startServer() throws IOException {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/internal/tracking-runs", exchange ->
+                respond(exchange, 200, """
+                        {"runs":[{"run_id":"run_1","trigger":"schedule","queued_count":2,
+                        "oldest_queued_at":"2026-11-22T08:00:00+08:00"}]}
+                        """));
+        server.createContext("/internal/tracking-tasks", exchange -> {
+            token.set(exchange.getRequestHeaders().getFirst("X-Internal-Token"));
+            claimBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            respond(exchange, 200, """
+                    {"run_id":"run_1","trigger":"schedule","items":[
+                      {"container_id":10,"container_no":"MSDU7172233","carrier":"MSC",
+                       "tracked_milestone":"POD_ARRIVAL","baseline_snapshot_id":5001,
+                       "last_success_at":"2026-11-21T08:01:00+08:00",
+                       "claim_token":"clm_1","max_retry":2}]}
+                    """);
+        });
+        server.createContext("/internal/tracking-results", exchange -> {
+            token.set(exchange.getRequestHeaders().getFirst("X-Internal-Token"));
+            reportBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            respond(exchange, 200, """
+                    {"snapshot_id":5003,"attempt_status":"success","events":[],
+                     "order_notification":{"state":"not_applicable",
+                       "notification_id":null,"status":null}}
+                    """);
+        });
+        server.start();
+
+        CollectorProperties properties = new CollectorProperties();
+        properties.setBaseUrl("http://127.0.0.1:" + server.getAddress().getPort());
+        properties.setInternalToken("secret-token");
+        client = new InternalApiClient(properties);
+    }
+
+    @AfterEach
+    void stopServer() {
+        server.stop(0);
+    }
+
+    @Test
+    void discoversClaimableRuns() {
+        List<TrackingRunDto> runs = client.discoverClaimableRuns(20);
+
+        assertThat(runs).hasSize(1);
+        assertThat(runs.getFirst().runId()).isEqualTo("run_1");
+        assertThat(runs.getFirst().queuedCount()).isEqualTo(2);
+        // Jackson normalises a serialized offset to its instant; the moment must survive.
+        assertThat(runs.getFirst().oldestQueuedAt().toInstant())
+                .isEqualTo(java.time.Instant.parse("2026-11-22T00:00:00Z"));
+    }
+
+    @Test
+    void claimsWithTheInternalTokenAndParsesTheTask() {
+        TrackingTaskClaimResponse claim = client.claimTasks("run_1", 5);
+
+        assertThat(claim.runId()).isEqualTo("run_1");
+        assertThat(claim.items()).hasSize(1);
+        assertThat(claim.items().getFirst().claimToken()).isEqualTo("clm_1");
+        assertThat(claim.items().getFirst().maxRetry()).isEqualTo(2);
+        assertThat(token.get()).isEqualTo("secret-token");
+        assertThat(claimBody.get()).contains("run_1").contains("5");
+    }
+
+    @Test
+    void sendsAResultReportAndParsesTheResponse() {
+        TrackingResultReport report = new TrackingResultReport(
+                "run_1", 10L, "MSDU7172233", "MSC", "clm_1", 0, 7,
+                OffsetDateTime.parse("2026-11-22T08:00:35+08:00"), true,
+                null, null, "Loaded on vessel", TransportStatus.LOADED,
+                List.of(new Eta(TrackedMilestone.POD_ARRIVAL, "Dec 06, 2026",
+                        LocalDate.of(2026, 12, 6), null, null, EtaPrecision.DATE, null)),
+                List.of(), "Busan, KR", "CAPE SOUNIO", "UK647R",
+                "Ningbo, CN", "Vancouver, CA", "Toronto, CA", "msc_web", null);
+
+        TrackingResultResponse response = client.report(report);
+
+        assertThat(response.snapshotId()).isEqualTo(5003);
+        assertThat(response.attemptStatus()).isEqualTo(AttemptStatus.SUCCESS);
+        assertThat(token.get()).isEqualTo("secret-token");
+        assertThat(reportBody.get())
+                .contains("\"run_id\":\"run_1\"")
+                .contains("\"container_id\":10")
+                .contains("\"mapping_version\":7")
+                .contains("\"transport_status\":\"LOADED\"");
+    }
+
+    private static void respond(HttpExchange exchange, int status, String body) throws IOException {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().add("Content-Type", "application/json");
+        exchange.sendResponseHeaders(status, bytes.length);
+        exchange.getResponseBody().write(bytes);
+        exchange.close();
+    }
+}

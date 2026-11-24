@@ -2,12 +2,16 @@ package com.shiptrack.collector;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * Entry point of the Playwright collector. It never listens on a port and never
  * holds database credentials; tasks come from the internal API only.
  */
 @SpringBootApplication
+@ConfigurationPropertiesScan
+@EnableScheduling
 public class CollectorApplication {
 
     public static void main(String[] args) {

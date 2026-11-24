@@ -1,0 +1,64 @@
+# Read-only status mapping for the collector. The API owns this file and bumps
+# `version` on every edit; the collector pins the version it used per task.
+#
+# Matching is a case-insensitive substring test on whitespace-normalised text.
+# The highest priority wins; UNKNOWN is the fallback and never guessed.
+#
+# The MSC phrases below are the first cut for the M2 probe. They must be
+# confirmed against the live page during the §13.1 validation; until then this
+# list only covers wording the requirements already quote.
+version: 1
+updated_at: "2026-11-24T21:00:00+08:00"
+mappings:
+  - carrier: MSC
+    match: "Empty container released"
+    transport_status: EMPTY_RELEASED
+    priority: 60
+  - carrier: MSC
+    match: "Empty pick up"
+    transport_status: EMPTY_PICKED_UP
+    priority: 60
+  - carrier: MSC
+    match: "Empty container picked up"
+    transport_status: EMPTY_PICKED_UP
+    priority: 65
+  - carrier: MSC
+    match: "Gate in"
+    transport_status: GATE_IN
+    priority: 70
+  - carrier: MSC
+    match: "Loaded on vessel"
+    transport_status: LOADED
+    priority: 80
+  - carrier: MSC
+    match: "Vessel departed"
+    transport_status: DEPARTED
+    priority: 80
+  - carrier: MSC
+    match: "Transshipment discharge"
+    transport_status: TRANSSHIP_DISCHARGED
+    priority: 75
+  - carrier: MSC
+    match: "Transshipment load"
+    transport_status: TRANSSHIP_LOADED
+    priority: 75
+  - carrier: MSC
+    match: "Arrived at port of discharge"
+    transport_status: ARRIVED_POD
+    priority: 85
+  - carrier: MSC
+    match: "Discharged from vessel"
+    transport_status: DISCHARGED
+    priority: 85
+  - carrier: MSC
+    match: "Available for pick up"
+    transport_status: AVAILABLE
+    priority: 90
+  - carrier: MSC
+    match: "Container picked up"
+    transport_status: PICKED_UP
+    priority: 90
+  - carrier: MSC
+    match: "Empty container returned"
+    transport_status: EMPTY_RETURNED
+    priority: 95

@@ -5,10 +5,48 @@ spring:
     web-application-type: none
 
 collector:
+  # Internal API. The token is injected from the environment; blank disables the loop.
   base-url: ${COLLECTOR_BASE_URL:http://localhost:8080}
   internal-token: ${INTERNAL_TOKEN:}
   concurrency: ${COLLECTOR_CONCURRENCY:1}
+  poll-interval-ms: ${COLLECTOR_POLL_INTERVAL_MS:30000}
+  poll-initial-delay-ms: ${COLLECTOR_POLL_INITIAL_DELAY_MS:15000}
+  claim-limit: ${COLLECTOR_CLAIM_LIMIT:1}
+  max-tasks-per-poll: ${COLLECTOR_MAX_TASKS_PER_POLL:100}
+  max-runs-per-poll: ${COLLECTOR_MAX_RUNS_PER_POLL:20}
+  retry-backoff-ms: ${COLLECTOR_RETRY_BACKOFF_MS:2000}
+  query-zone: ${COLLECTOR_QUERY_ZONE:Asia/Shanghai}
+  connect-timeout-ms: ${COLLECTOR_CONNECT_TIMEOUT_MS:5000}
+  read-timeout-ms: ${COLLECTOR_READ_TIMEOUT_MS:30000}
+
+  # Read-only mount; the API owns this file and bumps `version` on every change.
   mapping-path: ${MAPPING_PATH:/app/config/status-mappings.yaml}
+  mapping-reload-interval-ms: ${MAPPING_RELOAD_INTERVAL_MS:10000}
+
+  browser:
+    headless: ${COLLECTOR_HEADLESS:true}
+    user-agent: ${COLLECTOR_USER_AGENT:Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36}
+    viewport-width: ${COLLECTOR_VIEWPORT_WIDTH:1280}
+    viewport-height: ${COLLECTOR_VIEWPORT_HEIGHT:800}
+    locale: ${COLLECTOR_LOCALE:en-US}
+    timezone: ${COLLECTOR_TIMEZONE:Asia/Shanghai}
+    action-timeout-ms: ${COLLECTOR_ACTION_TIMEOUT_MS:15000}
+    navigation-timeout-ms: ${COLLECTOR_NAV_TIMEOUT_MS:45000}
+
+  msc:
+    base-url: ${MSC_BASE_URL:https://www.msc.com/en/track-a-shipment}
+    result-wait-ms: ${MSC_RESULT_WAIT_MS:30000}
+    query-timeout-ms: ${MSC_QUERY_TIMEOUT_MS:60000}
+    # Selectors are provisional until the §13.1 live validation is done.
+    container-input-selector: ${MSC_CONTAINER_INPUT_SELECTOR:input[name='trackingNumber'], input#trackingNumber, input[placeholder*='Container'], input[placeholder*='container']}
+    submit-selector: ${MSC_SUBMIT_SELECTOR:button[type='submit'], button:has-text('Track')}
+    result-selector: ${MSC_RESULT_SELECTOR:[data-testid='tracking-result'], .tracking-result, .tracking-details, .shipment-details}
+    status-selector: ${MSC_STATUS_SELECTOR:[data-testid='status'], .tracking-status, .status-value, .shipment-status}
+    event-row-selector: ${MSC_EVENT_ROW_SELECTOR:[data-testid='event-row'], .timeline li, .tracking-events li, table tbody tr}
+
+  circuit-breaker:
+    failure-threshold: ${COLLECTOR_CB_FAILURE_THRESHOLD:5}
+    cooldown-seconds: ${COLLECTOR_CB_COOLDOWN_SECONDS:60}
 
 logging:
   level:
