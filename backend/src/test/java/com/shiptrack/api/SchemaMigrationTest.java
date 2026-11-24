@@ -1,5 +1,6 @@
 package com.shiptrack.api;
 
+import com.shiptrack.contract.enums.TransportStatus;
 import org.flywaydb.core.Flyway;
 import org.flywaydb.core.api.MigrationInfo;
 import org.junit.jupiter.api.AfterAll;
@@ -21,6 +22,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Applies the real Flyway migration to a MySQL 8.4 container and verifies the
@@ -82,15 +84,117 @@ class SchemaMigrationTest {
     }
 
     @Test
-    void documentedIndexesExist() throws SQLException {
-        assertEquals(List.of("order_id", "container_no"),
-                indexColumns("containers", "uk_containers_order_container"));
-        assertEquals(List.of("run_id", "container_id"),
-                indexColumns("tracking_snapshots", "uk_snapshots_run_container"));
-        assertEquals(List.of("event_key"), indexColumns("tracking_events", "uk_events_event_key"));
-        assertEquals(List.of("notification_key"), indexColumns("notifications", "uk_notifications_key"));
-        assertEquals(List.of("archived_at", "updated_at"),
-                indexColumns("orders", "idx_orders_archived_updated"));
+    void allDocumentedIndexesExistWithExactColumnsAndUniqueness() throws SQLException {
+        assertIndex("orders", "uk_orders_order_no", true, "order_no");
+        assertIndex("orders", "idx_orders_archived_updated", false, "archived_at", "updated_at");
+
+        assertIndex("containers", "uk_containers_order_container", true, "order_id", "container_no");
+        assertIndex("containers", "idx_containers_active_order", false, "is_active", "order_id");
+        assertIndex("containers", "idx_containers_lock_run", false, "lock_run_id");
+
+        assertIndex("tracking_snapshots", "uk_snapshots_run_container", true, "run_id", "container_id");
+        assertIndex("tracking_snapshots", "idx_snapshots_container_finished", false,
+                "container_id", "finished_at");
+        assertIndex("tracking_snapshots", "idx_snapshots_status_claimed", false,
+                "attempt_status", "claimed_at");
+        assertIndex("tracking_snapshots", "idx_snapshots_queued", false, "queued_at");
+
+        assertIndex("tracking_events", "uk_events_event_key", true, "event_key");
+        assertIndex("tracking_events", "idx_events_container_detected", false,
+                "container_id", "detected_at");
+        assertIndex("tracking_events", "idx_events_notification", false, "notification_id");
+
+        assertIndex("notifications", "uk_notifications_key", true, "notification_key");
+        assertIndex("notifications", "idx_notifications_status_retry", false,
+                "status", "next_retry_at");
+        assertIndex("notifications", "idx_notifications_order_created", false,
+                "order_id", "created_at");
+    }
+
+    @Test
+    void everyTransportStatusFitsBothStatusColumns() throws SQLException {
+        assertEquals(16, TransportStatus.values().length);
+        assertEquals(32, columnLength("containers", "transport_status"));
+        assertEquals(32, columnLength("tracking_snapshots", "transport_status"));
+
+        try (Connection connection = open()) {
+            long orderId = insertReturningId(connection,
+                    "INSERT INTO orders (order_no) VALUES ('PO-ALL-STATUSES')");
+            long containerId = insertReturningId(connection,
+                    "INSERT INTO containers (order_id, container_no) VALUES ("
+                            + orderId + ", 'MSCU1234567')");
+
+            for (TransportStatus status : TransportStatus.values()) {
+                try (Statement statement = connection.createStatement()) {
+                    assertEquals(1, statement.executeUpdate(
+                            "UPDATE containers SET transport_status = '" + status.name()
+                                    + "' WHERE id = " + containerId));
+                }
+                insertReturningId(connection,
+                        "INSERT INTO tracking_snapshots (container_id, run_id, run_trigger, "
+                                + "attempt_status, queued_at, transport_status) VALUES ("
+                                + containerId + ", 'run_" + status.name() + "', 'schedule', "
+                                + "'success', UTC_TIMESTAMP(3), '" + status.name() + "')");
+                assertEquals(status, TransportStatus.valueOf(
+                        readString("SELECT transport_status FROM containers WHERE id = " + containerId)));
+            }
+
+            long snapshotStatuses = readInt("SELECT COUNT(*) FROM tracking_snapshots "
+                    + "WHERE container_id = " + containerId);
+            assertEquals(TransportStatus.values().length, snapshotStatuses);
+        }
+    }
+
+    @Test
+    void checksumValidDefaultsToTrueAndRecordsForcedInvalid() throws SQLException {
+        try (Connection connection = open()) {
+            long orderId = insertReturningId(connection,
+                    "INSERT INTO orders (order_no) VALUES ('PO-CHECKSUM')");
+            long validContainer = insertReturningId(connection,
+                    "INSERT INTO containers (order_id, container_no) VALUES ("
+                            + orderId + ", 'MSKU7654321')");
+            long forcedContainer = insertReturningId(connection,
+                    "INSERT INTO containers (order_id, container_no, checksum_valid) VALUES ("
+                            + orderId + ", 'MSKU7654322', 0)");
+
+            assertEquals(1, readInt("SELECT checksum_valid FROM containers WHERE id = " + validContainer));
+            assertEquals(0, readInt("SELECT checksum_valid FROM containers WHERE id = " + forcedContainer));
+        }
+    }
+
+    @Test
+    void everySnapshotReferenceIsDeleteRestricted() throws SQLException {
+        try (Connection connection = open()) {
+            long orderId = insertReturningId(connection,
+                    "INSERT INTO orders (order_no) VALUES ('PO-RESTRICT')");
+            long containerId = insertReturningId(connection,
+                    "INSERT INTO containers (order_id, container_no) VALUES ("
+                            + orderId + ", 'CMAU1234567')");
+
+            long baselineSnapshot = insertSnapshot(connection, containerId, "run_baseline");
+            long fromSnapshot = insertSnapshot(connection, containerId, "run_from");
+            long toSnapshot = insertSnapshot(connection, containerId, "run_to");
+            long eventBaselineSnapshot = insertSnapshot(connection, containerId, "run_evt_baseline");
+
+            try (Statement statement = connection.createStatement()) {
+                assertEquals(1, statement.executeUpdate(
+                        "UPDATE containers SET baseline_snapshot_id = " + baselineSnapshot
+                                + " WHERE id = " + containerId));
+            }
+            insertReturningId(connection,
+                    "INSERT INTO tracking_events (container_id, event_key, event_type, "
+                            + "from_snapshot_id, to_snapshot_id, baseline_snapshot_id, detected_at) "
+                            + "VALUES (" + containerId + ", 'evt_all_refs', 'ETA_CHANGED', "
+                            + fromSnapshot + ", " + toSnapshot + ", " + eventBaselineSnapshot
+                            + ", UTC_TIMESTAMP(3))");
+
+            for (long snapshotId : new long[]{
+                    baselineSnapshot, fromSnapshot, toSnapshot, eventBaselineSnapshot}) {
+                assertThrows(SQLException.class, () -> execute(
+                                "DELETE FROM tracking_snapshots WHERE id = " + snapshotId),
+                        () -> "snapshot " + snapshotId + " must be RESTRICT-referenced");
+            }
+        }
     }
 
     @Test
@@ -225,6 +329,68 @@ class SchemaMigrationTest {
                 keys.next();
                 return keys.getLong(1);
             }
+        }
+    }
+
+    private static void assertIndex(String table, String index, boolean unique, String... columns)
+            throws SQLException {
+        assertEquals(List.of(columns), indexColumns(table, index),
+                () -> "columns of " + table + "." + index);
+        assertEquals(unique, indexIsUnique(table, index),
+                () -> "uniqueness of " + table + "." + index);
+    }
+
+    private static boolean indexIsUnique(String table, String index) throws SQLException {
+        try (Connection connection = open();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT non_unique FROM information_schema.statistics "
+                             + "WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?")) {
+            statement.setString(1, table);
+            statement.setString(2, index);
+            try (ResultSet rows = statement.executeQuery()) {
+                assertTrue(rows.next(), () -> "index not found: " + table + "." + index);
+                return rows.getInt(1) == 0;
+            }
+        }
+    }
+
+    private static long columnLength(String table, String column) throws SQLException {
+        try (Connection connection = open();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT character_maximum_length FROM information_schema.columns "
+                             + "WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")) {
+            statement.setString(1, table);
+            statement.setString(2, column);
+            try (ResultSet rows = statement.executeQuery()) {
+                assertTrue(rows.next(), () -> "column not found: " + table + "." + column);
+                return rows.getLong(1);
+            }
+        }
+    }
+
+    private static long insertSnapshot(Connection connection, long containerId, String runId)
+            throws SQLException {
+        return insertReturningId(connection,
+                "INSERT INTO tracking_snapshots (container_id, run_id, run_trigger, "
+                        + "attempt_status, queued_at) VALUES (" + containerId + ", '" + runId
+                        + "', 'schedule', 'success', UTC_TIMESTAMP(3))");
+    }
+
+    private static int readInt(String sql) throws SQLException {
+        try (Connection connection = open();
+             Statement statement = connection.createStatement();
+             ResultSet rows = statement.executeQuery(sql)) {
+            assertTrue(rows.next());
+            return rows.getInt(1);
+        }
+    }
+
+    private static String readString(String sql) throws SQLException {
+        try (Connection connection = open();
+             Statement statement = connection.createStatement();
+             ResultSet rows = statement.executeQuery(sql)) {
+            assertTrue(rows.next());
+            return rows.getString(1);
         }
     }
 

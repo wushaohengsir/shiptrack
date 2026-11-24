@@ -13,7 +13,9 @@ import java.time.OffsetDateTime;
  *
  * <p>{@code trackedEta} only carries the ETA of the current {@code trackedMilestone};
  * a null {@code baselineSnapshotId} means no baseline has been established yet.
- * Source: 接口文档_终稿.md §3.2</p>
+ * {@code checksumValid} is false only when the container number was saved with an
+ * ISO 6346 check-digit failure via {@code force_invalid_containers=true}.
+ * Source: 接口文档_终稿.md §3.2 / §5.1</p>
  */
 public record ContainerDto(
         @JsonProperty("id") long id,
@@ -21,6 +23,7 @@ public record ContainerDto(
         @JsonProperty("container_no") String containerNo,
         @JsonProperty("carrier") String carrier,
         @JsonProperty("container_type") String containerType,
+        @JsonProperty("checksum_valid") boolean checksumValid,
         @JsonProperty("tracked_milestone") TrackedMilestone trackedMilestone,
         @JsonProperty("baseline_snapshot_id") Long baselineSnapshotId,
         @JsonProperty("transport_status") TransportStatus transportStatus,

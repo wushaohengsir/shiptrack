@@ -10,13 +10,15 @@ spring:
       minimum-idle: 2
       connection-timeout: 3000
       max-lifetime: 1800000
+      # Force every MySQL session to UTC; serverTimezone only affects driver parsing.
+      connection-init-sql: "SET time_zone = '+00:00'"
   flyway:
-    enabled: true
+    # API runs on a DML-only account; migrations happen once in the `migrate` profile.
+    enabled: false
     locations: classpath:db/migration
     baseline-on-migrate: false
-  jackson:
-    serialization:
-      write-dates-as-timestamps: false
+# Jackson 3 serialises java.time as ISO-8601 by default
+# (WRITE_DATES_AS_TIMESTAMPS moved to DateTimeFeature and is off).
 
 server:
   port: 8080

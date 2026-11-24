@@ -1,0 +1,15 @@
+# One-shot migration profile: run once with --spring.profiles.active=migrate,
+# using the DDL-capable migration account, then exit. The API never migrates.
+spring:
+  main:
+    web-application-type: none
+  datasource:
+    username: ${DB_MIGRATION_USER:${DB_USER:shiptrack}}
+    password: ${DB_MIGRATION_PASSWORD:${DB_PASSWORD:}}
+  flyway:
+    enabled: true
+
+logging:
+  level:
+    root: INFO
+    com.shiptrack: INFO
