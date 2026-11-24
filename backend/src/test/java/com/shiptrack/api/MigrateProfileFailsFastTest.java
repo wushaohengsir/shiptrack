@@ -4,46 +4,150 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 
+import java.util.Locale;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 /**
  * The `migrate` profile must fail fast when the dedicated migration credentials are
- * missing: no fallback to the API runtime account is allowed (技术栈使用说明 §3.7).
+ * missing or when the datasource credentials are overridden: no fallback to the API
+ * runtime account is allowed (技术栈使用说明 §3.7).
+ *
+ * <p>Command-line arguments are used for the override cases because they sit above
+ * YAML, {@code SPRING_DATASOURCE_*} and {@code -Dspring.datasource.*} in precedence
+ * order — the strongest form of the bypass reported as R-B3-2.
  */
 class MigrateProfileFailsFastTest {
 
+    private static final String MIGRATION_USER = "shiptrack_migration";
+    private static final String MIGRATION_PASSWORD = "migration-test";
+
+    private static final String MISSING_USER_MESSAGE =
+            "migrate profile requires DB_MIGRATION_USER; falling back to DB_USER/DB_PASSWORD is not allowed";
+    private static final String MISSING_PASSWORD_MESSAGE =
+            "migrate profile requires DB_MIGRATION_PASSWORD; falling back to DB_USER/DB_PASSWORD is not allowed";
+    private static final String OVERRIDDEN_USER_MESSAGE =
+            "migrate profile requires spring.datasource.username to come from DB_MIGRATION_USER;"
+                    + " overriding it with another value is not allowed";
+    private static final String OVERRIDDEN_PASSWORD_MESSAGE =
+            "migrate profile requires spring.datasource.password to come from DB_MIGRATION_PASSWORD;"
+                    + " overriding it with another value is not allowed";
+
     @Test
     void missingMigrationUserAbortsStartup() {
-        assertStartupFailsMentioning(Map.of("DB_MIGRATION_PASSWORD", "secret"), "DB_MIGRATION_USER");
+        assertGuardRejects(Map.of("DB_MIGRATION_PASSWORD", "secret"), MISSING_USER_MESSAGE);
     }
 
     @Test
     void missingMigrationPasswordAbortsStartup() {
-        assertStartupFailsMentioning(Map.of("DB_MIGRATION_USER", "shiptrack_migration"), "DB_MIGRATION_PASSWORD");
+        assertGuardRejects(Map.of("DB_MIGRATION_USER", MIGRATION_USER), MISSING_PASSWORD_MESSAGE);
     }
 
-    private static void assertStartupFailsMentioning(Map<String, Object> defaultProperties, String missingProperty) {
+    @Test
+    void missingMigrationUserAbortsEvenWhenDatasourceIsOverridden() {
+        assertGuardRejects(
+                Map.of("DB_MIGRATION_PASSWORD", "secret"),
+                MISSING_USER_MESSAGE,
+                "--spring.datasource.username=override_runtime",
+                "--spring.datasource.password=override_runtime");
+    }
+
+    @Test
+    void missingMigrationPasswordAbortsEvenWhenDatasourceIsOverridden() {
+        assertGuardRejects(
+                Map.of("DB_MIGRATION_USER", MIGRATION_USER),
+                MISSING_PASSWORD_MESSAGE,
+                "--spring.datasource.username=override_runtime",
+                "--spring.datasource.password=override_runtime");
+    }
+
+    @Test
+    void overriddenDatasourceUsernameIsRejected() {
+        // Pin the password on the command line so a leaked system property cannot
+        // change which credential the guard reports first.
+        assertGuardRejects(
+                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
+                OVERRIDDEN_USER_MESSAGE,
+                "--spring.datasource.username=override_runtime",
+                "--spring.datasource.password=" + MIGRATION_PASSWORD);
+    }
+
+    @Test
+    void overriddenDatasourcePasswordIsRejected() {
+        // Pin the username on the command line so a leaked system property cannot
+        // change which credential the guard reports first.
+        assertGuardRejects(
+                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
+                OVERRIDDEN_PASSWORD_MESSAGE,
+                "--spring.datasource.username=" + MIGRATION_USER,
+                "--spring.datasource.password=override_runtime");
+    }
+
+    private static void assertGuardRejects(
+            Map<String, Object> defaultProperties, String expectedMessage, String... args) {
         SpringApplicationBuilder builder = new SpringApplicationBuilder(ApiApplication.class)
                 .profiles("migrate")
                 .web(WebApplicationType.NONE)
                 .properties(defaultProperties);
 
-        Throwable failure = assertThrows(Throwable.class, builder::run,
-                "migrate profile must not start without " + missingProperty);
+        Throwable failure = assertThrows(Throwable.class, () -> builder.run(args),
+                () -> "migrate profile must not start; expected guard message: " + expectedMessage);
 
-        assertTrue(causeChainContains(failure, missingProperty),
-                () -> "startup failed for an unrelated reason; expected unresolved " + missingProperty
-                        + "\n" + describe(failure));
+        IllegalStateException guardFailure = findIllegalState(failure, expectedMessage);
+        assertNotNull(guardFailure,
+                () -> "guard did not reject startup with the expected message\n" + describe(failure));
+
+        assertFalse(hasFrameFrom(failure, "org.flywaydb"),
+                () -> "startup reached Flyway instead of failing in the credential guard\n" + describe(failure));
+        assertFalse(hasFrameFrom(failure, "com.mysql"),
+                () -> "startup reached the MySQL driver instead of failing in the credential guard\n"
+                        + describe(failure));
+        assertFalse(mentionsAny(failure, "communications link failure", "access denied", "flywayinitializer"),
+                () -> "startup failed at connection/Flyway stage rather than in the credential guard\n"
+                        + describe(failure));
     }
 
-    private static boolean causeChainContains(Throwable failure, String text) {
+    private static IllegalStateException findIllegalState(Throwable failure, String expectedMessage) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (current instanceof IllegalStateException candidate
+                    && expectedMessage.equals(candidate.getMessage())) {
+                return candidate;
+            }
+            if (current.getCause() == current) {
+                break;
+            }
+        }
+        return null;
+    }
+
+    private static boolean hasFrameFrom(Throwable failure, String classPrefix) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            for (StackTraceElement frame : current.getStackTrace()) {
+                if (frame.getClassName().startsWith(classPrefix)) {
+                    return true;
+                }
+            }
+            if (current.getCause() == current) {
+                break;
+            }
+        }
+        return false;
+    }
+
+    private static boolean mentionsAny(Throwable failure, String... needles) {
         for (Throwable current = failure; current != null; current = current.getCause()) {
             String message = current.getMessage();
-            if (message != null && message.contains(text)) {
-                return true;
+            if (message == null) {
+                continue;
+            }
+            String lowered = message.toLowerCase(Locale.ROOT);
+            for (String needle : needles) {
+                if (lowered.contains(needle)) {
+                    return true;
+                }
             }
             if (current.getCause() == current) {
                 break;
