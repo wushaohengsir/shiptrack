@@ -17,12 +17,20 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Reads the read-only {@code status-mappings.yaml} mount and keeps the last
- * good snapshot. A malformed update never replaces a working snapshot; the
- * collector keeps reporting the previous version and logs the failure.
+ * good snapshot.
+ *
+ * <p>Reload is atomic with respect to a task: the caller checks at the start of
+ * each task ({@link #refreshAndGet()}) and receives one immutable snapshot for
+ * the whole task. A malformed file, a version rollback, or a same-version rule
+ * change never replaces the working snapshot; the file identity is only
+ * committed after validation succeeds, so a broken file is retried on every
+ * tick and recovers as soon as it is fixed.</p>
  */
 @Component
 public class StatusMappingsLoader {
@@ -33,8 +41,7 @@ public class StatusMappingsLoader {
     private final ObjectMapper yaml = new ObjectMapper(new YAMLFactory()).registerModule(new JavaTimeModule());
 
     private volatile StatusMappingSet current;
-    private volatile FileTime lastModified;
-    private volatile long lastSize = -1;
+    private volatile FileIdentity identity;
 
     public StatusMappingsLoader(@Value("${collector.mapping-path}") String mappingPath) {
         this.path = Path.of(mappingPath);
@@ -46,34 +53,44 @@ public class StatusMappingsLoader {
         if (current != null) {
             return;
         }
-        StatusMappingSet loaded = read();
-        current = loaded;
-        log.info("Loaded {} status mappings, version {}", loaded.mappings().size(), loaded.version());
+        Loaded loaded = readValidated();
+        current = loaded.set();
+        identity = loaded.identity();
+        log.info("Loaded {} status mappings, version {}", loaded.set().mappings().size(), loaded.set().version());
     }
 
     /**
-     * Poll every {@code collector.mapping-reload-interval-ms} and swap only when
-     * the file identity changed. Renames (API atomic update) are handled because
-     * mtime and size are compared, never inode identity.
+     * Called at the start of every task. Returns the snapshot to pin for that
+     * task, reloading first when the mount changed. Any problem keeps the
+     * previous snapshot instead of failing the task.
      */
-    @Scheduled(fixedDelayString = "${collector.mapping-reload-interval-ms:10000}")
-    public synchronized void reloadIfChanged() {
+    public synchronized StatusMappingSet refreshAndGet() {
         try {
             if (!Files.isRegularFile(path)) {
-                return;
+                return snapshot();
             }
-            FileTime modified = Files.getLastModifiedTime(path);
-            long size = Files.size(path);
-            if (modified.equals(lastModified) && size == lastSize) {
-                return;
+            FileIdentity observed = readIdentity();
+            StatusMappingSet existing = current;
+            if (existing != null && observed.equals(identity)) {
+                return existing;
             }
-            StatusMappingSet loaded = read();
-            current = loaded;
-            log.info("Reloaded status mappings, version {}", loaded.version());
+            Loaded loaded = readValidated();
+            if (existing != null) {
+                validateTransition(existing, loaded.set());
+            }
+            current = loaded.set();
+            identity = loaded.identity();
+            log.info("Reloaded status mappings, version {}", loaded.set().version());
         } catch (RuntimeException | IOException e) {
             // Keep serving the previous snapshot; the next tick retries.
             log.warn("Status mapping reload failed, keeping the previous snapshot: {}", e.getMessage());
         }
+        return snapshot();
+    }
+
+    @Scheduled(fixedDelayString = "${collector.mapping-reload-interval-ms:10000}")
+    public synchronized void reloadIfChanged() {
+        refreshAndGet();
     }
 
     public StatusMappingSet snapshot() {
@@ -84,14 +101,36 @@ public class StatusMappingsLoader {
         return snapshot;
     }
 
-    private StatusMappingSet read() {
+    private Loaded readValidated() {
         try {
-            lastModified = Files.getLastModifiedTime(path);
-            lastSize = Files.size(path);
+            FileIdentity before = readIdentity();
             StatusMappingsDto dto = yaml.readValue(path.toFile(), StatusMappingsDto.class);
-            return validate(dto);
+            StatusMappingSet set = validate(dto);
+            FileIdentity after = readIdentity();
+            if (!before.equals(after)) {
+                // The API may have atomically replaced the file while we read.
+                // Retry on the next tick rather than pairing one version's
+                // rules with another version's identity.
+                throw new IllegalStateException("status mappings changed while reading");
+            }
+            return new Loaded(set, after);
         } catch (IOException e) {
             throw new IllegalStateException("cannot read status mappings from " + path + ": " + e.getMessage(), e);
+        }
+    }
+
+    private FileIdentity readIdentity() throws IOException {
+        return new FileIdentity(Files.getLastModifiedTime(path), Files.size(path));
+    }
+
+    private static void validateTransition(StatusMappingSet existing, StatusMappingSet loaded) {
+        if (loaded.version() < existing.version()) {
+            throw new IllegalArgumentException("version would go backwards: " + existing.version()
+                    + " -> " + loaded.version());
+        }
+        if (loaded.version() == existing.version() && !loaded.mappings().equals(existing.mappings())) {
+            throw new IllegalArgumentException("version " + loaded.version()
+                    + " already published with different rules");
         }
     }
 
@@ -106,6 +145,7 @@ public class StatusMappingsLoader {
             throw new IllegalArgumentException("mappings must not be empty");
         }
         List<StatusMapping> rows = new ArrayList<>(dto.mappings().size());
+        Map<String, StatusMapping> seen = new HashMap<>();
         for (int i = 0; i < dto.mappings().size(); i++) {
             StatusMappingDto row = dto.mappings().get(i);
             if (row == null) {
@@ -120,8 +160,25 @@ public class StatusMappingsLoader {
             if (row.transportStatus() == null) {
                 throw new IllegalArgumentException("mappings[" + i + "].transport_status is required");
             }
-            rows.add(new StatusMapping(row.carrier(), row.match(), row.transportStatus(), row.priority()));
+            StatusMapping mapping = new StatusMapping(row.carrier(), row.match(), row.transportStatus(), row.priority());
+            StatusMapping duplicate = seen.putIfAbsent(conflictKey(mapping), mapping);
+            if (duplicate != null && duplicate.transportStatus() != mapping.transportStatus()) {
+                throw new IllegalArgumentException("conflicting rules for carrier=" + row.carrier()
+                        + " match='" + row.match() + "' priority=" + row.priority());
+            }
+            rows.add(mapping);
         }
         return new StatusMappingSet(dto.version(), rows);
+    }
+
+    private static String conflictKey(StatusMapping mapping) {
+        String carrier = mapping.carrier().isBlank() ? "*" : mapping.carrier().trim().toLowerCase(java.util.Locale.ROOT);
+        return carrier + '\u0000' + StatusMappingSet.normalizeText(mapping.match()) + '\u0000' + mapping.priority();
+    }
+
+    private record FileIdentity(FileTime lastModified, long size) {
+    }
+
+    private record Loaded(StatusMappingSet set, FileIdentity identity) {
     }
 }

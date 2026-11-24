@@ -16,10 +16,16 @@ public class CollectorProperties {
     private String internalToken = "";
 
     private int pollIntervalMs = 30_000;
-    private int claimLimit = 1;
+    /** Tasks handled in one cycle; each is claimed with {@code limit:1} (§3.2). */
     private int maxTasksPerPoll = 100;
+    /** Runs requested per discovery call; the API caps this at 50 (§5.24). */
     private int maxRunsPerPoll = 20;
     private long retryBackoffMs = 2_000;
+    /** Bounded retries for a report that failed with a transient error (§11). */
+    private int reportMaxAttempts = 3;
+    private long reportBackoffMs = 1_000;
+    private long emptyRunBackoffMs = 10_000;
+    private long emptyClaimBackoffMs = 5_000;
     private String queryZone = "Asia/Shanghai";
     private int connectTimeoutMs = 5_000;
     private int readTimeoutMs = 30_000;
@@ -48,14 +54,6 @@ public class CollectorProperties {
         this.pollIntervalMs = pollIntervalMs;
     }
 
-    public int getClaimLimit() {
-        return claimLimit;
-    }
-
-    public void setClaimLimit(int claimLimit) {
-        this.claimLimit = claimLimit;
-    }
-
     public int getMaxTasksPerPoll() {
         return maxTasksPerPoll;
     }
@@ -78,6 +76,38 @@ public class CollectorProperties {
 
     public void setRetryBackoffMs(long retryBackoffMs) {
         this.retryBackoffMs = retryBackoffMs;
+    }
+
+    public int getReportMaxAttempts() {
+        return reportMaxAttempts;
+    }
+
+    public void setReportMaxAttempts(int reportMaxAttempts) {
+        this.reportMaxAttempts = reportMaxAttempts;
+    }
+
+    public long getReportBackoffMs() {
+        return reportBackoffMs;
+    }
+
+    public void setReportBackoffMs(long reportBackoffMs) {
+        this.reportBackoffMs = reportBackoffMs;
+    }
+
+    public long getEmptyRunBackoffMs() {
+        return emptyRunBackoffMs;
+    }
+
+    public void setEmptyRunBackoffMs(long emptyRunBackoffMs) {
+        this.emptyRunBackoffMs = emptyRunBackoffMs;
+    }
+
+    public long getEmptyClaimBackoffMs() {
+        return emptyClaimBackoffMs;
+    }
+
+    public void setEmptyClaimBackoffMs(long emptyClaimBackoffMs) {
+        this.emptyClaimBackoffMs = emptyClaimBackoffMs;
     }
 
     public String getQueryZone() {

@@ -57,7 +57,15 @@ public class MscProperties {
     private String loginFieldSelector = "input[type='password']";
 
     private int resultWaitMs = 30_000;
-    private int queryTimeoutMs = 60_000;
+    /** Hard per-query budget; §3.2 requires 30 s and the cap below enforces it. */
+    private int queryTimeoutMs = 30_000;
+    /** Time allowed for the tracking form to appear before it is a parse error. */
+    private int formWaitMs = 10_000;
+    /** Gap between carrier requests, plus random jitter (§3.2). */
+    private int minQueryIntervalMs = 500;
+    private int queryJitterMs = 1_000;
+    /** Backoff used when the carrier answers 429 without a Retry-After header. */
+    private long rateLimitBackoffMs = 30_000;
 
     /** Upper bound on the captured page text, to keep the raw payload small. */
     private int maxBodyChars = 32_768;
@@ -151,11 +159,43 @@ public class MscProperties {
     }
 
     public int getQueryTimeoutMs() {
-        return queryTimeoutMs;
+        return Math.min(30_000, Math.max(1_000, queryTimeoutMs));
     }
 
     public void setQueryTimeoutMs(int queryTimeoutMs) {
         this.queryTimeoutMs = queryTimeoutMs;
+    }
+
+    public int getFormWaitMs() {
+        return formWaitMs;
+    }
+
+    public void setFormWaitMs(int formWaitMs) {
+        this.formWaitMs = formWaitMs;
+    }
+
+    public int getMinQueryIntervalMs() {
+        return minQueryIntervalMs;
+    }
+
+    public void setMinQueryIntervalMs(int minQueryIntervalMs) {
+        this.minQueryIntervalMs = minQueryIntervalMs;
+    }
+
+    public int getQueryJitterMs() {
+        return queryJitterMs;
+    }
+
+    public void setQueryJitterMs(int queryJitterMs) {
+        this.queryJitterMs = queryJitterMs;
+    }
+
+    public long getRateLimitBackoffMs() {
+        return rateLimitBackoffMs;
+    }
+
+    public void setRateLimitBackoffMs(long rateLimitBackoffMs) {
+        this.rateLimitBackoffMs = rateLimitBackoffMs;
     }
 
     public int getMaxBodyChars() {

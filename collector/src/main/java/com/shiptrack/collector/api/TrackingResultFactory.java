@@ -9,7 +9,6 @@ import com.shiptrack.collector.msc.TrackingOutcome;
 import com.shiptrack.contract.dto.Eta;
 import com.shiptrack.contract.dto.SourceEvent;
 import com.shiptrack.contract.enums.EtaPrecision;
-import com.shiptrack.contract.enums.EventTimeType;
 import com.shiptrack.contract.enums.TransportStatus;
 import com.shiptrack.contract.internal.ClaimedTaskDto;
 import com.shiptrack.contract.internal.TrackingResultReport;
@@ -20,8 +19,8 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 /**
  * Turns an attempt into the exact report body of §5.23. The mapping snapshot is
@@ -33,6 +32,14 @@ public class TrackingResultFactory {
 
     private static final String SOURCE = "msc_web";
     private static final int MAX_ERROR_MESSAGE = 1_000;
+
+    /**
+     * A status line that only talks about an estimate is not an actual state.
+     * Reporting "estimated arrival at POD" as ARRIVED_POD would stop tracking
+     * before the ship has arrived.
+     */
+    private static final Pattern PLANNED_WORDING =
+            Pattern.compile("(?i)\\b(estimated|expected|planned|scheduled|eta)\\b");
 
     public TrackingResultReport build(String runId,
                                       ClaimedTaskDto task,
@@ -55,7 +62,9 @@ public class TrackingResultFactory {
                                                OffsetDateTime queriedAt) {
         ParsedTracking parsed = success.parsed();
         String carrier = task.carrier();
-        TransportStatus status = mappings.normalize(carrier, parsed.rawStatus());
+        TransportStatus status = isPlannedWording(parsed.rawStatus())
+                ? TransportStatus.UNKNOWN
+                : mappings.normalize(carrier, parsed.rawStatus());
 
         List<Eta> etas = new ArrayList<>();
         for (RawEta raw : parsed.etas()) {
@@ -166,24 +175,17 @@ public class TrackingResultFactory {
         TransportStatus milestone = mappings.normalize(carrier, text);
         return new SourceEvent(
                 milestone,
-                eventTimeType(text),
-                null,
-                null,
+                raw.eventTimeType(),
+                raw.occurredAt(),
+                raw.timezone(),
                 null,
                 null,
                 null,
                 text);
     }
 
-    private static EventTimeType eventTimeType(String text) {
-        String lower = text == null ? "" : text.toLowerCase(Locale.ROOT);
-        if (lower.contains("estimated") || lower.contains("expected") || lower.contains("planned")) {
-            return EventTimeType.PLANNED;
-        }
-        if (lower.contains("actual")) {
-            return EventTimeType.ACTUAL;
-        }
-        return null;
+    private static boolean isPlannedWording(String text) {
+        return text != null && PLANNED_WORDING.matcher(text).find();
     }
 
     private static Map<String, Object> rawPayload(MscPageSnapshot page) {

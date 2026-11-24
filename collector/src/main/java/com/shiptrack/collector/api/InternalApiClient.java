@@ -19,7 +19,7 @@ import java.util.List;
  * credentials and no business logic; every call carries the internal token.
  */
 @Component
-public class InternalApiClient {
+public class InternalApiClient implements CollectorApi {
 
     private final RestClient restClient;
 
@@ -36,6 +36,7 @@ public class InternalApiClient {
                 .build();
     }
 
+    @Override
     public List<TrackingRunDto> discoverClaimableRuns(int limit) {
         TrackingRunsResponse response = restClient.get()
                 .uri("/internal/tracking-runs?state=claimable&limit={limit}", limit)
@@ -44,6 +45,7 @@ public class InternalApiClient {
         return response == null || response.runs() == null ? List.of() : response.runs();
     }
 
+    @Override
     public TrackingTaskClaimResponse claimTasks(String runId, int limit) {
         TrackingTaskClaimResponse response = restClient.post()
                 .uri("/internal/tracking-tasks")
@@ -57,6 +59,7 @@ public class InternalApiClient {
         return response;
     }
 
+    @Override
     public TrackingResultResponse report(TrackingResultReport report) {
         return restClient.post()
                 .uri("/internal/tracking-results")

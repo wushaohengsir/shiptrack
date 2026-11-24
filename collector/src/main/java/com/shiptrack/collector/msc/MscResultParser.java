@@ -1,13 +1,16 @@
 package com.shiptrack.collector.msc;
 
+import com.shiptrack.contract.enums.EventTimeType;
 import com.shiptrack.contract.enums.TrackedMilestone;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDate;
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -52,12 +55,22 @@ public final class MscResultParser {
             throw new MscParseException("no status text found for container " + containerNo);
         }
 
+        String pol = match(POL, body);
+        String pod = match(POD, body);
+        String finalDestination = match(FINAL_DESTINATION, body);
+
         List<RawEvent> events = new ArrayList<>();
         for (String line : snapshot.eventLines()) {
             String trimmed = line == null ? "" : line.trim();
-            if (!trimmed.isEmpty()) {
-                events.add(new RawEvent(trimmed));
+            if (trimmed.isEmpty()) {
+                continue;
             }
+            Optional<EtaTextParser.ZonedTime> time = EtaTextParser.parseTime(trimmed);
+            events.add(new RawEvent(
+                    trimmed,
+                    eventTimeType(trimmed),
+                    EtaTextParser.parseDateTime(trimmed).orElse(null),
+                    time.map(EtaTextParser.ZonedTime::timezone).orElse(null)));
         }
 
         return new ParsedTracking(
@@ -65,19 +78,26 @@ public final class MscResultParser {
                 match(LOCATION, body),
                 match(VESSEL, body),
                 match(VOYAGE, body),
-                match(POL, body),
-                match(POD, body),
-                match(FINAL_DESTINATION, body),
-                parseEtas(body, snapshot.eventLines()),
+                pol,
+                pod,
+                finalDestination,
+                parseEtas(body, snapshot.eventLines(), pod, finalDestination),
                 events);
     }
 
-    private List<RawEta> parseEtas(String body, List<String> eventLines) {
-        Set<String> seen = new LinkedHashSet<>();
-        List<RawEta> etas = new ArrayList<>();
+    /**
+     * Only publishes an ETA when the line names the monitored node. A line that
+     * talks about a transshipment port, or does not identify the node at all,
+     * is dropped instead of being guessed as the POD arrival.
+     */
+    private List<RawEta> parseEtas(String body, List<String> eventLines,
+                                   String pod, String finalDestination) {
         List<String> candidates = new ArrayList<>();
         body.lines().forEach(candidates::add);
         candidates.addAll(eventLines);
+
+        Map<TrackedMilestone, RawEta> chosen = new LinkedHashMap<>();
+        Set<TrackedMilestone> conflicting = new HashSet<>();
 
         for (String candidate : candidates) {
             String line = candidate == null ? "" : candidate.trim();
@@ -85,25 +105,87 @@ public final class MscResultParser {
                 continue;
             }
             Optional<LocalDate> date = EtaTextParser.parseDate(line);
-            if (date.isEmpty()) {
+            Optional<TrackedMilestone> milestone = etaMilestone(line, pod, finalDestination);
+            if (date.isEmpty() || milestone.isEmpty()) {
                 continue;
             }
             String rawValue = line.length() > MAX_RAW_VALUE ? line.substring(0, MAX_RAW_VALUE) : line;
-            TrackedMilestone milestone = line.toLowerCase(Locale.ROOT).contains("final destination")
-                    ? TrackedMilestone.FINAL_DESTINATION
-                    : TrackedMilestone.POD_ARRIVAL;
-            if (!seen.add(milestone + "|" + rawValue)) {
-                continue;
-            }
             Optional<EtaTextParser.ZonedTime> time = EtaTextParser.parseTime(line);
-            etas.add(new RawEta(
-                    milestone,
+            RawEta eta = new RawEta(
+                    milestone.get(),
                     rawValue,
                     date.get(),
                     time.map(EtaTextParser.ZonedTime::time).orElse(null),
-                    time.map(EtaTextParser.ZonedTime::timezone).orElse(null)));
+                    time.map(EtaTextParser.ZonedTime::timezone).orElse(null));
+
+            RawEta existing = chosen.putIfAbsent(milestone.get(), eta);
+            if (existing != null && !sameEta(existing, eta)) {
+                // Two different values for one node: publish neither rather
+                // than guessing which is current.
+                conflicting.add(milestone.get());
+            }
         }
-        return etas;
+        conflicting.forEach(chosen::remove);
+        return new ArrayList<>(chosen.values());
+    }
+
+    private static Optional<TrackedMilestone> etaMilestone(String line, String pod, String finalDestination) {
+        String lower = line.toLowerCase(Locale.ROOT);
+        if (lower.contains("transship") || lower.contains("tranship")
+                || lower.contains("transit") || lower.contains("connection")
+                || lower.contains("via ")) {
+            return Optional.empty();
+        }
+        if (lower.contains("final destination")) {
+            return Optional.of(TrackedMilestone.FINAL_DESTINATION);
+        }
+        boolean mentionsPod = containsPlace(lower, pod);
+        boolean mentionsFinal = containsPlace(lower, finalDestination);
+        if (mentionsFinal && !mentionsPod) {
+            return Optional.of(TrackedMilestone.FINAL_DESTINATION);
+        }
+        if (mentionsPod) {
+            return Optional.of(TrackedMilestone.POD_ARRIVAL);
+        }
+        if (lower.contains("port of discharge") || lower.contains("discharge port")
+                || lower.matches(".*\\bpod\\b.*") || lower.contains("arrival at pod")) {
+            return Optional.of(TrackedMilestone.POD_ARRIVAL);
+        }
+        return Optional.empty();
+    }
+
+    private static boolean containsPlace(String haystack, String place) {
+        if (place == null || place.isBlank()) {
+            return false;
+        }
+        String city = place.split(",")[0].trim().toLowerCase(Locale.ROOT);
+        return city.length() > 2 && haystack.contains(city);
+    }
+
+    private static boolean sameEta(RawEta left, RawEta right) {
+        return left.date().equals(right.date())
+                && java.util.Objects.equals(left.time(), right.time())
+                && java.util.Objects.equals(left.timezone(), right.timezone());
+    }
+
+    private static EventTimeType eventTimeType(String line) {
+        String lower = line.toLowerCase(Locale.ROOT);
+        if (lower.contains("cancel") || lower.contains("void")) {
+            return EventTimeType.CANCELLED;
+        }
+        if (lower.contains("estimated") || lower.contains("expected")
+                || lower.contains("planned") || lower.contains("scheduled")
+                || lower.matches(".*\\beta\\b.*")) {
+            return EventTimeType.PLANNED;
+        }
+        if (lower.contains("actual") || lower.contains("gate in") || lower.contains("loaded")
+                || lower.contains("departed") || lower.contains("discharged")
+                || lower.contains("arrived") || lower.contains("available")
+                || lower.contains("picked up") || lower.contains("returned")
+                || lower.contains("released") || lower.contains("transshipment")) {
+            return EventTimeType.ACTUAL;
+        }
+        return null;
     }
 
     private static String match(Pattern pattern, String body) {

@@ -32,7 +32,7 @@ public class CollectorRunner {
     private static final Logger log = LoggerFactory.getLogger(CollectorRunner.class);
 
     private final CollectorProperties properties;
-    private final InternalApiClient api;
+    private final CollectorApi api;
     private final MscTrackingClient trackingClient;
     private final StatusMappingsLoader mappingsLoader;
     private final TrackingResultFactory resultFactory;
@@ -41,7 +41,7 @@ public class CollectorRunner {
     private final AtomicBoolean warnedMissingToken = new AtomicBoolean(false);
 
     public CollectorRunner(CollectorProperties properties,
-                           InternalApiClient api,
+                           CollectorApi api,
                            MscTrackingClient trackingClient,
                            StatusMappingsLoader mappingsLoader,
                            TrackingResultFactory resultFactory) {
@@ -78,25 +78,29 @@ public class CollectorRunner {
     private void runCycle() {
         int processed = 0;
         int maxTasks = Math.max(1, properties.getMaxTasksPerPoll());
-        int claimSize = Math.min(20, Math.max(1, properties.getClaimLimit()));
+        int maxRuns = Math.min(50, Math.max(1, properties.getMaxRunsPerPoll()));
 
-        List<TrackingRunDto> runs = api.discoverClaimableRuns(Math.max(1, properties.getMaxRunsPerPoll()));
+        List<TrackingRunDto> runs = api.discoverClaimableRuns(maxRuns);
+        if (runs.isEmpty()) {
+            sleep(properties.getEmptyRunBackoffMs());
+            return;
+        }
         for (TrackingRunDto run : runs) {
-            if (processed >= maxTasks) {
-                break;
-            }
             while (processed < maxTasks) {
-                TrackingTaskClaimResponse claim = api.claimTasks(run.runId(), claimSize);
-                if (claim.items() == null || claim.items().isEmpty()) {
+                // §3.2: always claim exactly one task, process and report it,
+                // then claim the next. Claiming a batch and walking away would
+                // hold leases for tasks this cycle never runs.
+                TrackingTaskClaimResponse claim = api.claimTasks(run.runId(), 1);
+                if (claim == null || claim.items() == null || claim.items().isEmpty()) {
+                    sleep(properties.getEmptyClaimBackoffMs());
                     break;
                 }
-                for (ClaimedTaskDto task : claim.items()) {
-                    if (processed >= maxTasks) {
-                        break;
-                    }
-                    processTask(claim.runId(), task);
-                    processed++;
-                }
+                ClaimedTaskDto task = claim.items().getFirst();
+                processTask(claim.runId() == null ? run.runId() : claim.runId(), task);
+                processed++;
+            }
+            if (processed >= maxTasks) {
+                break;
             }
         }
         if (processed > 0) {
@@ -105,8 +109,9 @@ public class CollectorRunner {
     }
 
     private void processTask(String runId, ClaimedTaskDto task) {
-        // Fix the mapping version before the first query, per §5.23 / §6.2.
-        StatusMappingSet mappings = mappingsLoader.snapshot();
+        // §3.2: check the mount and fix the mapping snapshot before the query.
+        // The same snapshot and version are used for the whole task.
+        StatusMappingSet mappings = mappingsLoader.refreshAndGet();
 
         int retryCount = 0;
         TrackingOutcome outcome = trackingClient.query(task.containerNo());
@@ -123,19 +128,50 @@ public class CollectorRunner {
         OffsetDateTime queriedAt = OffsetDateTime.now(ZoneId.of(properties.getQueryZone()));
         TrackingResultReport report = resultFactory.build(runId, task, mappings, outcome, retryCount, queriedAt);
 
-        try {
-            api.report(report);
-            log.info("Reported run_id={} container_id={} success={} retry={}",
-                    runId, task.containerId(), report.success(), retryCount);
-        } catch (RestClientResponseException e) {
-            // 409 STALE_CLAIM / CONFLICT means another writer owns the row now;
-            // both are terminal for this attempt and must not be retried.
-            log.warn("Report rejected run_id={} container_id={} http={} body={}",
-                    runId, task.containerId(), e.getStatusCode().value(), firstLine(e.getResponseBodyAsString()));
-        } catch (RestClientException e) {
-            log.warn("Report failed run_id={} container_id={}: {}",
-                    runId, task.containerId(), firstLine(e.getMessage()));
+        reportWithRetry(runId, task, report);
+    }
+
+    /**
+     * §11: a transient API failure must not throw away a result the carrier was
+     * already queried for. Retry the same body, keeping {@code claim_token},
+     * {@code queried_at} and {@code retry_count}, within the lease.
+     * 409/4xx are terminal: another writer owns the row or the request is invalid.
+     */
+    private void reportWithRetry(String runId, ClaimedTaskDto task, TrackingResultReport report) {
+        int maxAttempts = Math.max(1, properties.getReportMaxAttempts());
+        long backoff = Math.max(0, properties.getReportBackoffMs());
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                api.report(report);
+                log.info("Reported run_id={} container_id={} success={} retry={}",
+                        runId, task.containerId(), report.success(), report.retryCount());
+                return;
+            } catch (RestClientResponseException e) {
+                int status = e.getStatusCode().value();
+                if (!isTransient(status) || attempt == maxAttempts) {
+                    // 409 STALE_CLAIM / CONFLICT and other 4xx are terminal.
+                    log.warn("Report rejected run_id={} container_id={} http={} attempt={} body={}",
+                            runId, task.containerId(), status, attempt,
+                            firstLine(e.getResponseBodyAsString()));
+                    return;
+                }
+                log.warn("Transient report failure run_id={} container_id={} http={}, retrying {}/{}",
+                        runId, task.containerId(), status, attempt, maxAttempts);
+            } catch (RestClientException e) {
+                if (attempt == maxAttempts) {
+                    log.error("Report failed run_id={} container_id={} after {} attempts: {}",
+                            runId, task.containerId(), attempt, firstLine(e.getMessage()));
+                    return;
+                }
+                log.warn("Transient report failure run_id={} container_id={} ({}), retrying {}/{}",
+                        runId, task.containerId(), firstLine(e.getMessage()), attempt, maxAttempts);
+            }
+            sleep(backoff * attempt);
         }
+    }
+
+    private static boolean isTransient(int status) {
+        return status >= 500 || status == 408 || status == 429;
     }
 
     private static void sleep(long millis) {

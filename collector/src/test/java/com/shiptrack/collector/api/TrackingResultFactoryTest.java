@@ -8,6 +8,7 @@ import com.shiptrack.collector.msc.RawEta;
 import com.shiptrack.collector.msc.RawEvent;
 import com.shiptrack.collector.msc.TrackingOutcome;
 import com.shiptrack.contract.enums.EtaPrecision;
+import com.shiptrack.contract.enums.EventTimeType;
 import com.shiptrack.contract.enums.TrackedMilestone;
 import com.shiptrack.contract.enums.TransportStatus;
 import com.shiptrack.contract.internal.AgentErrorCode;
@@ -46,7 +47,7 @@ class TrackingResultFactoryTest {
                 "Busan, KR", "CAPE SOUNIO", "UK647R",
                 "Ningbo, CN", "Vancouver, CA", "Toronto, CA",
                 List.of(new RawEta(TrackedMilestone.POD_ARRIVAL, "06 Dec 2026 14:30 EST",
-                        LocalDate.of(2026, 12, 6), LocalTime.of(14, 30), "America/New_York")),
+                        LocalDate.of(2026, 12, 6), LocalTime.of(14, 30), "Etc/GMT+5")),
                 List.of(new RawEvent("Gate in")));
         TrackingOutcome.Success outcome = new TrackingOutcome.Success(parsed, page());
 
@@ -66,10 +67,60 @@ class TrackingResultFactoryTest {
         assertThat(report.etas().getFirst().precision()).isEqualTo(EtaPrecision.DATETIME);
         assertThat(report.etas().getFirst().utcAt())
                 .isEqualTo(Instant.parse("2026-12-06T19:30:00Z"));
-        assertThat(report.etas().getFirst().timezone()).isEqualTo("America/New_York");
+        assertThat(report.etas().getFirst().timezone()).isEqualTo("Etc/GMT+5");
 
         assertThat(report.sourceEvents()).hasSize(1);
         assertThat(report.sourceEvents().getFirst().milestone()).isEqualTo(TransportStatus.GATE_IN);
+    }
+
+    @Test
+    void keepsDateOnlyEtaWithoutInventingATime() {
+        ParsedTracking parsed = new ParsedTracking(
+                "Loaded on vessel", null, null, null, null, null, null,
+                List.of(new RawEta(TrackedMilestone.POD_ARRIVAL, "Dec 06, 2026",
+                        LocalDate.of(2026, 12, 6), null, null)),
+                List.of());
+
+        TrackingResultReport report = factory.build("run_1", task, mappings,
+                new TrackingOutcome.Success(parsed, page()), 0, QUERIED_AT);
+
+        assertThat(report.etas()).hasSize(1);
+        assertThat(report.etas().getFirst().precision()).isEqualTo(EtaPrecision.DATE);
+        assertThat(report.etas().getFirst().time()).isNull();
+        assertThat(report.etas().getFirst().utcAt()).isNull();
+    }
+
+    @Test
+    void plannedWordingNeverBecomesAnActualTransportStatus() {
+        StatusMappingSet planned = new StatusMappingSet(7, List.of(
+                new StatusMapping("MSC", "Estimated arrival at POD", TransportStatus.ARRIVED_POD, 100)));
+        ParsedTracking parsed = new ParsedTracking(
+                "Estimated arrival at POD", null, null, null, null, null, null,
+                List.of(), List.of());
+
+        TrackingResultReport report = factory.build("run_1", task, planned,
+                new TrackingOutcome.Success(parsed, page()), 0, QUERIED_AT);
+
+        assertThat(report.rawStatus()).isEqualTo("Estimated arrival at POD");
+        assertThat(report.transportStatus()).isEqualTo(TransportStatus.UNKNOWN);
+    }
+
+    @Test
+    void copiesEventTimestampAndTimeSemantics() {
+        OffsetDateTime occurredAt = OffsetDateTime.parse("2026-11-21T16:20:00+01:00");
+        ParsedTracking parsed = new ParsedTracking(
+                "Loaded on vessel", null, null, null, null, null, null, List.of(),
+                List.of(new RawEvent("Vessel departure cancelled", EventTimeType.CANCELLED,
+                        occurredAt, "Etc/GMT-1")));
+
+        TrackingResultReport report = factory.build("run_1", task, mappings,
+                new TrackingOutcome.Success(parsed, page()), 0, QUERIED_AT);
+
+        assertThat(report.sourceEvents()).hasSize(1);
+        assertThat(report.sourceEvents().getFirst().eventTimeType()).isEqualTo(EventTimeType.CANCELLED);
+        assertThat(report.sourceEvents().getFirst().occurredAt()).isEqualTo(occurredAt);
+        assertThat(report.sourceEvents().getFirst().timezone()).isEqualTo("Etc/GMT-1");
+        assertThat(report.sourceEvents().getFirst().rawText()).isEqualTo("Vessel departure cancelled");
     }
 
     @Test

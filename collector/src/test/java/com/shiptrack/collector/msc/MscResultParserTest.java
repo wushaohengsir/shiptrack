@@ -1,10 +1,12 @@
 package com.shiptrack.collector.msc;
 
+import com.shiptrack.contract.enums.EventTimeType;
 import com.shiptrack.contract.enums.TrackedMilestone;
 import org.junit.jupiter.api.Test;
 
 import java.time.LocalDate;
 import java.time.LocalTime;
+import java.time.OffsetDateTime;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -24,7 +26,6 @@ class MscResultParserTest {
             Final Destination: Toronto, CA
             Current Location: Busan, KR
             Estimated arrival at POD: Dec 06, 2026
-            Gateway ETA: 06 Dec 2026 14:30 EST
             """;
 
     @Test
@@ -44,17 +45,74 @@ class MscResultParserTest {
     void parsesDateOnlyAndDateTimeEtas() {
         ParsedTracking parsed = parser.parse(snapshot(BODY, null, List.of()), "MSDU7172233");
 
-        assertThat(parsed.etas()).hasSize(2);
-        RawEta dateOnly = parsed.etas().get(0);
+        assertThat(parsed.etas()).hasSize(1);
+        RawEta dateOnly = parsed.etas().getFirst();
         assertThat(dateOnly.milestone()).isEqualTo(TrackedMilestone.POD_ARRIVAL);
         assertThat(dateOnly.date()).isEqualTo(LocalDate.of(2026, 12, 6));
         assertThat(dateOnly.time()).isNull();
         assertThat(dateOnly.timezone()).isNull();
 
-        RawEta withTime = parsed.etas().get(1);
-        assertThat(withTime.date()).isEqualTo(LocalDate.of(2026, 12, 6));
-        assertThat(withTime.time()).isEqualTo(LocalTime.of(14, 30));
-        assertThat(withTime.timezone()).isEqualTo("America/New_York");
+        String withTime = """
+                Container MSDU7172233
+                Status: Loaded on vessel
+                Port of Discharge: Vancouver, CA
+                Estimated arrival at POD: 06 Dec 2026 14:30 EST
+                """;
+        RawEta dateTime = parser.parse(snapshot(withTime, null, List.of()), "MSDU7172233")
+                .etas().getFirst();
+        assertThat(dateTime.date()).isEqualTo(LocalDate.of(2026, 12, 6));
+        assertThat(dateTime.time()).isEqualTo(LocalTime.of(14, 30));
+        assertThat(dateTime.timezone()).isEqualTo("Etc/GMT+5");
+    }
+
+    @Test
+    void bindsFinalDestinationEtaToTheFinalDestinationNode() {
+        String body = """
+                Status: Discharged from vessel
+                Port of Discharge: Vancouver, CA
+                Final Destination: Toronto, CA
+                Estimated arrival at final destination: Dec 09, 2026
+                """;
+        ParsedTracking parsed = parser.parse(snapshot(body, null, List.of()), "MSDU7172233");
+
+        assertThat(parsed.etas()).hasSize(1);
+        assertThat(parsed.etas().getFirst().milestone()).isEqualTo(TrackedMilestone.FINAL_DESTINATION);
+    }
+
+    @Test
+    void dropsTransshipmentEtaInsteadOfBindingItToThePod() {
+        String body = """
+                Status: Transshipment load
+                Port of Discharge: Vancouver, CA
+                Transshipment arrival at Singapore: Dec 02, 2026
+                Estimated arrival at POD: Dec 06, 2026
+                """;
+        ParsedTracking parsed = parser.parse(snapshot(body, null, List.of()), "MSDU7172233");
+
+        assertThat(parsed.etas()).hasSize(1);
+        assertThat(parsed.etas().getFirst().milestone()).isEqualTo(TrackedMilestone.POD_ARRIVAL);
+        assertThat(parsed.etas().getFirst().date()).isEqualTo(LocalDate.of(2026, 12, 6));
+    }
+
+    @Test
+    void dropsAmbiguousEtaThatDoesNotNameTheMonitoredNode() {
+        String body = """
+                Status: Loaded on vessel
+                Gateway ETA: 06 Dec 2026 14:30 EST
+                """;
+        ParsedTracking parsed = parser.parse(snapshot(body, null, List.of()), "MSDU7172233");
+        assertThat(parsed.etas()).isEmpty();
+    }
+
+    @Test
+    void refusesConflictingEtasForTheSameNode() {
+        String body = """
+                Status: Loaded on vessel
+                Estimated arrival at POD: Dec 06, 2026
+                Estimated arrival at port of discharge: Dec 08, 2026
+                """;
+        ParsedTracking parsed = parser.parse(snapshot(body, null, List.of()), "MSDU7172233");
+        assertThat(parsed.etas()).isEmpty();
     }
 
     @Test
@@ -70,6 +128,31 @@ class MscResultParserTest {
                 "MSDU7172233");
         assertThat(parsed.events()).extracting(RawEvent::rawText)
                 .containsExactly("Gate in - Oct 21", "Loaded on vessel - Oct 24");
+    }
+
+    @Test
+    void extractsEventTimeAndSemanticsWhenThePageStatesThem() {
+        ParsedTracking parsed = parser.parse(
+                snapshot(BODY, null, List.of(
+                        "Gate in - 2026-11-21 16:20 CET",
+                        "Estimated arrival at POD - Dec 06, 2026 14:30 EST",
+                        "Vessel departure cancelled - 2026-11-25 09:00 UTC")),
+                "MSDU7172233");
+
+        RawEvent actual = parsed.events().get(0);
+        assertThat(actual.eventTimeType()).isEqualTo(EventTimeType.ACTUAL);
+        assertThat(actual.occurredAt())
+                .isEqualTo(OffsetDateTime.parse("2026-11-21T16:20:00+01:00"));
+        assertThat(actual.timezone()).isEqualTo("Etc/GMT-1");
+
+        RawEvent planned = parsed.events().get(1);
+        assertThat(planned.eventTimeType()).isEqualTo(EventTimeType.PLANNED);
+        assertThat(planned.occurredAt())
+                .isEqualTo(OffsetDateTime.parse("2026-12-06T14:30:00-05:00"));
+
+        RawEvent cancelled = parsed.events().get(2);
+        assertThat(cancelled.eventTimeType()).isEqualTo(EventTimeType.CANCELLED);
+        assertThat(cancelled.occurredAt()).isEqualTo(OffsetDateTime.parse("2026-11-25T09:00:00Z"));
     }
 
     @Test

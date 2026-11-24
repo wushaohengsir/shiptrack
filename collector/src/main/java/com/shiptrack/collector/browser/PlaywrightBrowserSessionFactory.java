@@ -22,17 +22,6 @@ public class PlaywrightBrowserSessionFactory implements BrowserSessionFactory {
 
     private static final Logger log = LoggerFactory.getLogger(PlaywrightBrowserSessionFactory.class);
 
-    /**
-     * The site's scripts check for the most common automation marker. The flag
-     * and the init script only restore the normal value a regular Chrome reports.
-     */
-    private static final List<String> LAUNCH_ARGS = List.of(
-            "--disable-blink-features=AutomationControlled",
-            "--disable-dev-shm-usage");
-
-    private static final String INIT_SCRIPT =
-            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });";
-
     private final BrowserProperties properties;
     private final ResourceBlockPolicy blockPolicy;
 
@@ -55,7 +44,6 @@ public class PlaywrightBrowserSessionFactory implements BrowserSessionFactory {
                 .setTimezoneId(properties.getTimezone())
                 .setExtraHTTPHeaders(Map.of("Accept-Language", properties.getLocale() + ",en;q=0.8")));
         try {
-            context.addInitScript(INIT_SCRIPT);
             context.route("**/*", route -> {
                 if (blockPolicy.isBlocked(route.request().resourceType(), route.request().url())) {
                     route.abort();
@@ -78,11 +66,22 @@ public class PlaywrightBrowserSessionFactory implements BrowserSessionFactory {
             return;
         }
         playwright = Playwright.create();
-        browser = playwright.chromium().launch(new BrowserType.LaunchOptions()
-                .setHeadless(properties.isHeadless())
-                .setArgs(LAUNCH_ARGS));
-        log.info("Chromium launched (headless={}, version={})",
+        browser = playwright.chromium().launch(launchOptions());
+        log.info("Chromium launched (headless={}, sandbox=true, version={})",
                 properties.isHeadless(), browser.version());
+    }
+
+    /**
+     * Launch configuration kept in one place so it can be asserted without a
+     * browser: the sandbox stays on, and Playwright's own
+     * {@code --disable-dev-shm-usage} default is filtered because the container
+     * supplies {@code shm_size} instead.
+     */
+    BrowserType.LaunchOptions launchOptions() {
+        return new BrowserType.LaunchOptions()
+                .setHeadless(properties.isHeadless())
+                .setChromiumSandbox(true)
+                .setIgnoreDefaultArgs(List.of("--disable-dev-shm-usage"));
     }
 
     @Override

@@ -18,17 +18,11 @@ class StatusMappingsLoaderTest {
     @TempDir
     Path tempDir;
 
+    private long clock = 1;
+
     @Test
     void loadsVersionAndMappings() throws IOException {
-        Path file = write("""
-                version: 2
-                updated_at: "2026-11-24T20:00:00+08:00"
-                mappings:
-                  - carrier: MSC
-                    match: "Gate in"
-                    transport_status: GATE_IN
-                    priority: 90
-                """);
+        Path file = write(2, "Gate in", "GATE_IN", 90);
 
         StatusMappingsLoader loader = new StatusMappingsLoader(file.toString());
         loader.loadOnStartup();
@@ -39,43 +33,97 @@ class StatusMappingsLoaderTest {
     }
 
     @Test
-    void reloadsWhenTheFileChanges() throws IOException {
-        Path file = write("""
-                version: 1
-                updated_at: "2026-11-24T20:00:00+08:00"
-                mappings:
-                  - carrier: MSC
-                    match: "Gate in"
-                    transport_status: GATE_IN
-                    priority: 90
-                """);
+    void refreshAndGetSeesANewVersionAtTheNextTaskStart() throws IOException {
+        Path file = write(1, "Gate in", "GATE_IN", 90);
+        StatusMappingsLoader loader = new StatusMappingsLoader(file.toString());
+        loader.loadOnStartup();
+        StatusMappingSet firstTask = loader.refreshAndGet();
+
+        write(file, 2, "Available for pick up", "AVAILABLE", 95);
+        StatusMappingSet secondTask = loader.refreshAndGet();
+
+        assertThat(firstTask.version()).isEqualTo(1);
+        assertThat(firstTask.normalize("MSC", "Available for pick up")).isEqualTo(TransportStatus.UNKNOWN);
+        assertThat(secondTask.version()).isEqualTo(2);
+        assertThat(secondTask.normalize("MSC", "Available for pick up")).isEqualTo(TransportStatus.AVAILABLE);
+    }
+
+    @Test
+    void aPinnedSnapshotKeepsWorkingWhileTheFileChangesMidTask() throws IOException {
+        Path file = write(1, "Gate in", "GATE_IN", 90);
         StatusMappingsLoader loader = new StatusMappingsLoader(file.toString());
         loader.loadOnStartup();
 
-        Files.writeString(file, """
-                version: 2
-                updated_at: "2026-11-24T20:05:00+08:00"
-                mappings:
-                  - carrier: MSC
-                    match: "Gate in"
-                    transport_status: GATE_IN
-                    priority: 90
-                  - carrier: MSC
-                    match: "Available"
-                    transport_status: AVAILABLE
-                    priority: 95
-                """);
-        Files.setLastModifiedTime(file, FileTime.from(Instant.now().plusSeconds(5)));
-        loader.reloadIfChanged();
+        StatusMappingSet pinned = loader.refreshAndGet();
+        write(file, 2, "Gate in", "LOADED", 90);
+        StatusMappingSet nextTask = loader.refreshAndGet();
 
-        assertThat(loader.snapshot().version()).isEqualTo(2);
-        assertThat(loader.snapshot().normalize("MSC", "Available for pick up"))
-                .isEqualTo(TransportStatus.AVAILABLE);
+        // The in-flight task keeps the rules it started with, even though the
+        // mount now publishes a newer version.
+        assertThat(pinned.version()).isEqualTo(1);
+        assertThat(pinned.normalize("MSC", "Gate in")).isEqualTo(TransportStatus.GATE_IN);
+        assertThat(nextTask.version()).isEqualTo(2);
+        assertThat(nextTask.normalize("MSC", "Gate in")).isEqualTo(TransportStatus.LOADED);
+    }
+
+    @Test
+    void rejectsAVersionRollbackAndKeepsTheNewerSnapshot() throws IOException {
+        Path file = write(2, "Gate in", "GATE_IN", 90);
+        StatusMappingsLoader loader = new StatusMappingsLoader(file.toString());
+        loader.loadOnStartup();
+
+        write(file, 1, "Gate in", "LOADED", 90);
+        StatusMappingsLoader reloaded = loader;
+
+        assertThat(reloaded.refreshAndGet().version()).isEqualTo(2);
+        assertThat(reloaded.snapshot().normalize("MSC", "Gate in")).isEqualTo(TransportStatus.GATE_IN);
+    }
+
+    @Test
+    void rejectsChangedRulesUnderAnAlreadyPublishedVersion() throws IOException {
+        Path file = write(2, "Gate in", "GATE_IN", 90);
+        StatusMappingsLoader loader = new StatusMappingsLoader(file.toString());
+        loader.loadOnStartup();
+
+        write(file, 2, "Gate in", "LOADED", 90);
+
+        assertThat(loader.refreshAndGet().normalize("MSC", "Gate in"))
+                .isEqualTo(TransportStatus.GATE_IN);
     }
 
     @Test
     void keepsThePreviousSnapshotWhenTheNewFileIsInvalid() throws IOException {
-        Path file = write("""
+        Path file = write(1, "Gate in", "GATE_IN", 90);
+        StatusMappingsLoader loader = new StatusMappingsLoader(file.toString());
+        loader.loadOnStartup();
+
+        overwrite(file, """
+                version: 0
+                mappings: []
+                """);
+
+        assertThat(loader.refreshAndGet().version()).isEqualTo(1);
+    }
+
+    @Test
+    void recoversAfterABrokenFileIsFixed() throws IOException {
+        Path file = write(1, "Gate in", "GATE_IN", 90);
+        StatusMappingsLoader loader = new StatusMappingsLoader(file.toString());
+        loader.loadOnStartup();
+
+        overwrite(file, "version: [this is not valid yaml");
+        assertThat(loader.refreshAndGet().version()).isEqualTo(1);
+
+        // The failed read must not have committed the file identity, so this
+        // fix is detected even though the file was already "seen".
+        write(file, 2, "Gate in", "GATE_IN", 90);
+
+        assertThat(loader.refreshAndGet().version()).isEqualTo(2);
+    }
+
+    @Test
+    void rejectsRulesThatDisagreeAtTheSamePriority() throws IOException {
+        Path file = write(() -> """
                 version: 1
                 updated_at: "2026-11-24T20:00:00+08:00"
                 mappings:
@@ -83,18 +131,16 @@ class StatusMappingsLoaderTest {
                     match: "Gate in"
                     transport_status: GATE_IN
                     priority: 90
+                  - carrier: msc
+                    match: "GATE  IN"
+                    transport_status: LOADED
+                    priority: 90
                 """);
         StatusMappingsLoader loader = new StatusMappingsLoader(file.toString());
-        loader.loadOnStartup();
 
-        Files.writeString(file, """
-                version: 0
-                mappings: []
-                """);
-        Files.setLastModifiedTime(file, FileTime.from(Instant.now().plusSeconds(5)));
-        loader.reloadIfChanged();
-
-        assertThat(loader.snapshot().version()).isEqualTo(1);
+        assertThatThrownBy(loader::loadOnStartup)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("conflicting rules");
     }
 
     @Test
@@ -105,9 +151,43 @@ class StatusMappingsLoaderTest {
                 .hasMessageContaining("cannot read status mappings");
     }
 
-    private Path write(String yaml) throws IOException {
+    private Path write(int version, String match, String status, int priority) throws IOException {
+        return write(() -> """
+                version: %d
+                updated_at: "2026-11-24T20:00:00+08:00"
+                mappings:
+                  - carrier: MSC
+                    match: "%s"
+                    transport_status: %s
+                    priority: %d
+                """.formatted(version, match, status, priority));
+    }
+
+    private void write(Path file, int version, String match, String status, int priority) throws IOException {
+        overwrite(file, """
+                version: %d
+                updated_at: "2026-11-24T20:05:00+08:00"
+                mappings:
+                  - carrier: MSC
+                    match: "%s"
+                    transport_status: %s
+                    priority: %d
+                """.formatted(version, match, status, priority));
+    }
+
+    private Path write(MappingWriter writer) throws IOException {
         Path file = tempDir.resolve("status-mappings.yaml");
-        Files.writeString(file, yaml);
+        overwrite(file, writer.content());
         return file;
+    }
+
+    private void overwrite(Path file, String yaml) throws IOException {
+        Files.writeString(file, yaml);
+        Files.setLastModifiedTime(file, FileTime.from(Instant.ofEpochSecond(++clock)));
+    }
+
+    @FunctionalInterface
+    private interface MappingWriter {
+        String content();
     }
 }
