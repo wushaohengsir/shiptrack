@@ -10,6 +10,9 @@ spring:
     password: ${DB_MIGRATION_PASSWORD}
   flyway:
     enabled: true
+    # Do not set spring.flyway.url/user/password or spring.datasource.hikari.jdbc-url:
+    # MigrateCredentialGuardConfiguration rejects them so Flyway cannot open its own
+    # connection and every migration credential comes from DB_MIGRATION_* only.
 
 logging:
   level:

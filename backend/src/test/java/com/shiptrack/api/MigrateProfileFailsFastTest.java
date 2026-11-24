@@ -8,27 +8,32 @@ import org.springframework.context.ConfigurableApplicationContext;
 import java.util.Locale;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 
 /**
  * The `migrate` profile must fail fast when the dedicated migration credentials are
- * missing or when the datasource credentials are overridden: no fallback to the API
- * runtime account is allowed (技术栈使用说明 §3.7).
+ * missing or overridden: no fallback to the API runtime account is allowed
+ * (技术栈使用说明 §3.7). No test here connects to a database — every rejection case
+ * aborts in the {@link MigrateCredentialGuardConfiguration} BeanFactoryPostProcessor,
+ * before a datasource or Flyway bean is created.
  *
  * <p>Command-line arguments are used for the override cases because they sit above
  * YAML, {@code SPRING_DATASOURCE_*} and {@code -Dspring.datasource.*} in precedence
  * order — the strongest form of the bypass reported as R-B3-2.
  *
- * <p>Overrides of {@code spring.datasource.hikari.*} and {@code spring.flyway.*} are
- * covered as well: they can redirect the account or database that really runs the
- * migration (R-B3-3).
+ * <p>R-B3-3: Flyway and Hikari must not be able to build a second connection. Presence
+ * of {@code spring.flyway.url/user/password} or {@code spring.datasource.hikari.jdbc-url}
+ * is rejected even when the value matches the guarded one, including relaxed spellings,
+ * and a {@code spring.datasource.url} carrying credentials is rejected outright.
  */
 class MigrateProfileFailsFastTest {
 
     private static final String MIGRATION_USER = "shiptrack_migration";
     private static final String MIGRATION_PASSWORD = "migration-test";
+    private static final String DATABASE_URL = "jdbc:mysql://db.example:3306/shiptrack";
 
     private static final String MISSING_USER_MESSAGE =
             "migrate profile requires DB_MIGRATION_USER; falling back to DB_USER/DB_PASSWORD is not allowed";
@@ -40,21 +45,34 @@ class MigrateProfileFailsFastTest {
     private static final String OVERRIDDEN_PASSWORD_MESSAGE =
             "migrate profile requires spring.datasource.password to come from DB_MIGRATION_PASSWORD;"
                     + " overriding it with another value is not allowed";
+    private static final String BLANK_USER_MESSAGE =
+            "migrate profile forbids setting spring.datasource.username to a blank value";
+    private static final String BLANK_PASSWORD_MESSAGE =
+            "migrate profile forbids setting spring.datasource.password to a blank value";
+    private static final String BLANK_HIKARI_USER_MESSAGE =
+            "migrate profile forbids setting spring.datasource.hikari.username to a blank value";
     private static final String OVERRIDDEN_HIKARI_USER_MESSAGE =
             "migrate profile requires spring.datasource.hikari.username to come from DB_MIGRATION_USER;"
                     + " overriding it with another value is not allowed";
-    private static final String OVERRIDDEN_FLYWAY_USER_MESSAGE =
-            "migrate profile requires spring.flyway.user to come from DB_MIGRATION_USER;"
-                    + " overriding it with another value is not allowed";
-    private static final String OVERRIDDEN_FLYWAY_PASSWORD_MESSAGE =
-            "migrate profile requires spring.flyway.password to come from DB_MIGRATION_PASSWORD;"
-                    + " overriding it with another value is not allowed";
-    private static final String OVERRIDDEN_HIKARI_URL_MESSAGE =
-            "migrate profile requires spring.datasource.hikari.jdbc-url to match spring.datasource.url;"
-                    + " pointing the migration at another database is not allowed";
-    private static final String OVERRIDDEN_FLYWAY_URL_MESSAGE =
-            "migrate profile requires spring.flyway.url to match spring.datasource.url;"
-                    + " pointing the migration at another database is not allowed";
+    private static final String FORBIDDEN_HIKARI_URL_MESSAGE =
+            "migrate profile forbids spring.datasource.hikari.jdbc-url;"
+                    + " the migration must use the single datasource configured by DB_MIGRATION_USER"
+                    + " and DB_MIGRATION_PASSWORD";
+    private static final String FORBIDDEN_FLYWAY_URL_MESSAGE =
+            "migrate profile forbids spring.flyway.url;"
+                    + " the migration must use the single datasource configured by DB_MIGRATION_USER"
+                    + " and DB_MIGRATION_PASSWORD";
+    private static final String FORBIDDEN_FLYWAY_USER_MESSAGE =
+            "migrate profile forbids spring.flyway.user;"
+                    + " the migration must use the single datasource configured by DB_MIGRATION_USER"
+                    + " and DB_MIGRATION_PASSWORD";
+    private static final String FORBIDDEN_FLYWAY_PASSWORD_MESSAGE =
+            "migrate profile forbids spring.flyway.password;"
+                    + " the migration must use the single datasource configured by DB_MIGRATION_USER"
+                    + " and DB_MIGRATION_PASSWORD";
+    private static final String EMBEDDED_CREDENTIALS_MESSAGE =
+            "migrate profile forbids credentials embedded in spring.datasource.url;"
+                    + " use DB_MIGRATION_USER and DB_MIGRATION_PASSWORD instead";
 
     @Test
     void missingMigrationUserAbortsStartup() {
@@ -64,6 +82,14 @@ class MigrateProfileFailsFastTest {
     @Test
     void missingMigrationPasswordAbortsStartup() {
         assertGuardRejects(Map.of("DB_MIGRATION_USER", MIGRATION_USER), MISSING_PASSWORD_MESSAGE);
+    }
+
+    @Test
+    void blankMigrationUserAbortsStartup() {
+        assertGuardRejects(
+                Map.of("DB_MIGRATION_PASSWORD", "secret"),
+                MISSING_USER_MESSAGE,
+                "--DB_MIGRATION_USER=");
     }
 
     @Test
@@ -89,7 +115,7 @@ class MigrateProfileFailsFastTest {
         // Pin the password on the command line so a leaked system property cannot
         // change which credential the guard reports first.
         assertGuardRejects(
-                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
+                completeCredentials(),
                 OVERRIDDEN_USER_MESSAGE,
                 "--spring.datasource.username=override_runtime",
                 "--spring.datasource.password=" + MIGRATION_PASSWORD);
@@ -100,10 +126,24 @@ class MigrateProfileFailsFastTest {
         // Pin the username on the command line so a leaked system property cannot
         // change which credential the guard reports first.
         assertGuardRejects(
-                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
+                completeCredentials(),
                 OVERRIDDEN_PASSWORD_MESSAGE,
                 "--spring.datasource.username=" + MIGRATION_USER,
                 "--spring.datasource.password=override_runtime");
+    }
+
+    @Test
+    void blankDatasourceUsernameIsRejected() {
+        assertGuardRejects(completeCredentials(), BLANK_USER_MESSAGE, "--spring.datasource.username=");
+    }
+
+    @Test
+    void blankDatasourcePasswordIsRejected() {
+        assertGuardRejects(
+                completeCredentials(),
+                BLANK_PASSWORD_MESSAGE,
+                "--spring.datasource.username=" + MIGRATION_USER,
+                "--spring.datasource.password=");
     }
 
     @Test
@@ -111,43 +151,87 @@ class MigrateProfileFailsFastTest {
         // Hikari applies spring.datasource.hikari.* after the standard properties, so
         // this is a real account swap even when spring.datasource.username is correct.
         assertGuardRejects(
-                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
+                completeCredentials(),
                 OVERRIDDEN_HIKARI_USER_MESSAGE,
                 "--spring.datasource.hikari.username=override_runtime");
     }
 
     @Test
-    void overriddenHikariUrlIsRejected() {
+    void blankHikariUsernameIsRejected() {
         assertGuardRejects(
-                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
-                OVERRIDDEN_HIKARI_URL_MESSAGE,
-                "--spring.datasource.hikari.jdbc-url=jdbc:mysql://override.example:3306/shiptrack");
+                completeCredentials(),
+                BLANK_HIKARI_USER_MESSAGE,
+                "--spring.datasource.hikari.username=");
     }
 
     @Test
-    void overriddenFlywayUserIsRejected() {
+    void hikariUrlIsForbiddenEvenWhenItMatchesTheDatasourceUrl() {
+        assertGuardRejects(
+                completeCredentials(),
+                FORBIDDEN_HIKARI_URL_MESSAGE,
+                "--spring.datasource.url=" + DATABASE_URL,
+                "--spring.datasource.hikari.jdbc-url=" + DATABASE_URL);
+    }
+
+    @Test
+    void relaxedHikariUrlSpellingIsForbidden() {
+        // Boot's relaxed binding accepts camelCase for Hikari's jdbcUrl, so the guard
+        // must see it too.
+        assertGuardRejects(
+                completeCredentials(),
+                FORBIDDEN_HIKARI_URL_MESSAGE,
+                "--spring.datasource.hikari.jdbcUrl=" + DATABASE_URL);
+    }
+
+    @Test
+    void flywayUserIsForbidden() {
         // spring.flyway.user makes Flyway build its own DataSource, bypassing the
         // guarded Hikari connection (R-B3-3).
         assertGuardRejects(
-                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
-                OVERRIDDEN_FLYWAY_USER_MESSAGE,
+                completeCredentials(),
+                FORBIDDEN_FLYWAY_USER_MESSAGE,
                 "--spring.flyway.user=shiptrack_runtime");
     }
 
     @Test
-    void overriddenFlywayPasswordIsRejected() {
+    void flywayUserIsForbiddenEvenWhenItMatchesTheMigrationVariable() {
         assertGuardRejects(
-                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
-                OVERRIDDEN_FLYWAY_PASSWORD_MESSAGE,
+                completeCredentials(),
+                FORBIDDEN_FLYWAY_USER_MESSAGE,
+                "--spring.flyway.user=" + MIGRATION_USER);
+    }
+
+    @Test
+    void flywayPasswordIsForbidden() {
+        assertGuardRejects(
+                completeCredentials(),
+                FORBIDDEN_FLYWAY_PASSWORD_MESSAGE,
                 "--spring.flyway.password=runtime-decoy");
     }
 
     @Test
-    void overriddenFlywayUrlIsRejected() {
+    void flywayPasswordIsForbiddenEvenWhenItMatchesTheMigrationVariable() {
         assertGuardRejects(
-                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
-                OVERRIDDEN_FLYWAY_URL_MESSAGE,
+                completeCredentials(),
+                FORBIDDEN_FLYWAY_PASSWORD_MESSAGE,
+                "--spring.flyway.password=" + MIGRATION_PASSWORD);
+    }
+
+    @Test
+    void flywayUrlIsForbidden() {
+        assertGuardRejects(
+                completeCredentials(),
+                FORBIDDEN_FLYWAY_URL_MESSAGE,
                 "--spring.flyway.url=jdbc:mysql://override.example:3306/shiptrack");
+    }
+
+    @Test
+    void flywayUrlIsForbiddenEvenWhenItMatchesTheDatasourceUrl() {
+        assertGuardRejects(
+                completeCredentials(),
+                FORBIDDEN_FLYWAY_URL_MESSAGE,
+                "--spring.datasource.url=" + DATABASE_URL,
+                "--spring.flyway.url=" + DATABASE_URL);
     }
 
     @Test
@@ -160,21 +244,51 @@ class MigrateProfileFailsFastTest {
     }
 
     @Test
-    void matchingFlywayOverridesAreAllowed() {
-        // Explicit but identical values are not a bypass; the guard only rejects a
-        // different account or target. Flyway is disabled so the context starts
+    void datasourceUrlWithEmbeddedUserParameterIsRejected() {
+        assertGuardRejects(
+                completeCredentials(),
+                EMBEDDED_CREDENTIALS_MESSAGE,
+                "--spring.datasource.url=jdbc:mysql://db.example:3306/shiptrack?user=shiptrack_runtime");
+    }
+
+    @Test
+    void datasourceUrlWithEmbeddedPasswordParameterIsRejected() {
+        assertGuardRejects(
+                completeCredentials(),
+                EMBEDDED_CREDENTIALS_MESSAGE,
+                "--spring.datasource.url=jdbc:mysql://db.example:3306/shiptrack?useSSL=false&PASSWORD=secret");
+    }
+
+    @Test
+    void datasourceUrlWithUserInfoIsRejected() {
+        assertGuardRejects(
+                completeCredentials(),
+                EMBEDDED_CREDENTIALS_MESSAGE,
+                "--spring.datasource.url=jdbc:mysql://shiptrack_runtime:secret@db.example:3306/shiptrack");
+    }
+
+    @Test
+    void standardDatasourceUrlWithConnectionParametersStarts() {
+        // A URL with ordinary driver parameters is legitimate; the guard must not
+        // mistake them for credentials. Flyway is disabled so the context starts
         // without a database call.
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(ApiApplication.class)
                 .profiles("migrate")
                 .web(WebApplicationType.NONE)
-                .properties(Map.of(
-                        "DB_MIGRATION_USER", MIGRATION_USER,
-                        "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD))
+                .properties(completeCredentials())
                 .run("--spring.flyway.enabled=false",
-                        "--spring.flyway.user=" + MIGRATION_USER,
-                        "--spring.flyway.password=" + MIGRATION_PASSWORD)) {
+                        "--spring.datasource.url=jdbc:mysql://localhost:3306/shiptrack"
+                                + "?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC"
+                                + "&useSSL=false&allowPublicKeyRetrieval=true")) {
             assertNotNull(context.getId());
+            assertEquals(MIGRATION_USER,
+                    context.getEnvironment().getProperty("spring.datasource.username"));
         }
+    }
+
+    private static Map<String, Object> completeCredentials() {
+        return Map.of("DB_MIGRATION_USER", MIGRATION_USER,
+                "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD);
     }
 
     private static void assertGuardRejects(
