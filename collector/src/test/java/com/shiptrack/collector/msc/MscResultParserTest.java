@@ -68,6 +68,7 @@ class MscResultParserTest {
     @Test
     void bindsFinalDestinationEtaToTheFinalDestinationNode() {
         String body = """
+                Container MSDU7172233
                 Status: Discharged from vessel
                 Port of Discharge: Vancouver, CA
                 Final Destination: Toronto, CA
@@ -82,6 +83,7 @@ class MscResultParserTest {
     @Test
     void dropsTransshipmentEtaInsteadOfBindingItToThePod() {
         String body = """
+                Container MSDU7172233
                 Status: Transshipment load
                 Port of Discharge: Vancouver, CA
                 Transshipment arrival at Singapore: Dec 02, 2026
@@ -97,6 +99,7 @@ class MscResultParserTest {
     @Test
     void dropsAmbiguousEtaThatDoesNotNameTheMonitoredNode() {
         String body = """
+                Container MSDU7172233
                 Status: Loaded on vessel
                 Gateway ETA: 06 Dec 2026 14:30 EST
                 """;
@@ -107,6 +110,7 @@ class MscResultParserTest {
     @Test
     void refusesConflictingEtasForTheSameNode() {
         String body = """
+                Container MSDU7172233
                 Status: Loaded on vessel
                 Estimated arrival at POD: Dec 06, 2026
                 Estimated arrival at port of discharge: Dec 08, 2026
@@ -117,7 +121,8 @@ class MscResultParserTest {
 
     @Test
     void fallsBackToTheStatusLabelWhenTheSelectorFoundNothing() {
-        ParsedTracking parsed = parser.parse(snapshot("Status: Gate in", null, List.of()), "MSDU7172233");
+        ParsedTracking parsed = parser.parse(
+                snapshot("Container MSDU7172233\nStatus: Gate in", null, List.of()), "MSDU7172233");
         assertThat(parsed.rawStatus()).isEqualTo("Gate in");
     }
 
@@ -210,8 +215,113 @@ class MscResultParserTest {
                 .hasMessageContaining("no status text");
     }
 
+    @Test
+    void refusesWhenNoResultBlockIsVisible() {
+        MscPageSnapshot page = new MscPageSnapshot(
+                "Container Tracking", "https://www.msc.com/track",
+                "Container MSDU7172233\nLoading...", null, List.of(), false);
+        assertThatThrownBy(() -> parser.parse(page, "MSDU7172233"))
+                .isInstanceOf(MscParseException.class)
+                .hasMessageContaining("no visible result block");
+    }
+
+    @Test
+    void refusesAResultBlockWithoutAContainerNumber() {
+        String block = "Status: Gate in";
+        assertThatThrownBy(() -> parser.parse(snapshotWithBlock("", block), "MSDU7172233"))
+                .isInstanceOf(MscParseException.class)
+                .hasMessageContaining("does not identify a container");
+    }
+
+    @Test
+    void refusesAResultBlockShowingTwoContainers() {
+        String block = """
+                Container MSDU7172233
+                Container MSKU1234567
+                Status: Loaded on vessel
+                """;
+        assertThatThrownBy(() -> parser.parse(snapshotWithBlock(block, block), "MSDU7172233"))
+                .isInstanceOf(MscParseException.class)
+                .hasMessageContaining("more than one container");
+    }
+
+    @Test
+    void refusesWhenThePageNamesTheContainerButTheBlockBelongsToAnother() {
+        // Regression: scanning the whole page saw MSDU7172233 and accepted a
+        // block that actually showed MAEU1234567 as picked up.
+        String body = """
+                Container MSDU7172233
+                Status: In transit
+                """;
+        String block = """
+                Container MAEU1234567
+                Status: Container picked up
+                """;
+        assertThatThrownBy(() -> parser.parse(snapshotWithBlock(body, block), "MSDU7172233"))
+                .isInstanceOf(MscParseException.class)
+                .hasMessageContaining("another container");
+    }
+
+    @Test
+    void parsesOnlyTheBlockThatNamesTheQueriedContainer() {
+        String body = """
+                Previous search: MSKU1234567 (Container picked up)
+                Current result:
+                Container MSDU7172233
+                Status: Loaded on vessel
+                """;
+        String block = """
+                Container MSDU7172233
+                Status: Loaded on vessel
+                """;
+        ParsedTracking parsed = parser.parse(snapshotWithBlock(body, block), "MSDU7172233");
+        assertThat(parsed.rawStatus()).isEqualTo("Loaded on vessel");
+    }
+
+    @Test
+    void excludesADepartureThatLooksLikeAnArrivalEta() {
+        String body = """
+                Container MSDU7172233
+                Status: Loaded on vessel
+                Port of Discharge: Vancouver, CA
+                Scheduled departure from Vancouver on 2026-12-06
+                """;
+        assertThat(parser.parse(snapshot(body, null, List.of()), "MSDU7172233").etas()).isEmpty();
+    }
+
+    @Test
+    void excludesACancelledEta() {
+        String body = """
+                Container MSDU7172233
+                Status: Loaded on vessel
+                Port of Discharge: Vancouver, CA
+                POD ETA cancelled: 2026-12-06
+                """;
+        assertThat(parser.parse(snapshot(body, null, List.of()), "MSDU7172233").etas()).isEmpty();
+    }
+
+    @Test
+    void dropsALineThatMixesAnActualDateWithAnEstimate() {
+        String body = """
+                Container MSDU7172233
+                Status: Departed
+                Port of Discharge: Vancouver, CA
+                Arrived at Vancouver 2026-11-20, ETA POD 2026-12-06
+                """;
+        assertThat(parser.parse(snapshot(body, null, List.of()), "MSDU7172233").etas()).isEmpty();
+    }
+
     private static MscPageSnapshot snapshot(String body, String statusText, List<String> eventLines) {
+        return snapshotWithBlock(body, body, statusText, eventLines);
+    }
+
+    private static MscPageSnapshot snapshotWithBlock(String body, String block) {
+        return snapshotWithBlock(body, block, null, List.of());
+    }
+
+    private static MscPageSnapshot snapshotWithBlock(String body, String block, String statusText,
+                                                     List<String> eventLines) {
         return new MscPageSnapshot("Container Tracking", "https://www.msc.com/track", body, statusText,
-                eventLines, false);
+                eventLines, false, block);
     }
 }

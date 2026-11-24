@@ -83,6 +83,46 @@ class MscProbeBrowserTest {
             </body></html>
             """;
 
+    /** A background 200 arrives before the real tracking request answers 429. */
+    private static final String BACKGROUND_200_THEN_TRACK_429 = """
+            <html><body>
+            <form onsubmit="var c=document.getElementById('container').value;
+              fetch('/config');
+              fetch('/track-429?container='+c);return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            </body></html>
+            """;
+
+    /** A background 5xx must not beat the valid tracking result. */
+    private static final String BACKGROUND_500_THEN_RESULT = """
+            <html><body>
+            <form onsubmit="var c=document.getElementById('container').value;
+              fetch('/banner-500');
+              document.getElementById('status').textContent='Status: Loaded on vessel '+c;
+              document.getElementById('result').style.display='block';return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result" style="display:none"><div id="status"></div></div>
+            </body></html>
+            """;
+
+    /** A visible block for another container that was never produced by this query. */
+    private static final String STALE_OTHER_RESULT = """
+            <html><body>
+            <form onsubmit="return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result">
+              <div>Container MAEU1234567</div>
+              <div>Status: Container picked up</div>
+            </div>
+            </body></html>
+            """;
+
     private HttpServer server;
     private PlaywrightBrowserSessionFactory factory;
     private MscProperties properties;
@@ -205,6 +245,26 @@ class MscProbeBrowserTest {
         assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
     }
 
+    @Test
+    void classifiesTheTracking429EvenWhenABackground200ArrivedFirst() {
+        properties.setBaseUrl(baseUrl("/background-429"));
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.RATE_LIMITED);
+    }
+
+    @Test
+    void keepsAValidResultEvenWhenABackgroundRequestFailed() {
+        properties.setBaseUrl(baseUrl("/background-500"));
+        assertThat(probe.query("MSDU7172233")).isInstanceOf(TrackingOutcome.Success.class);
+    }
+
+    @Test
+    void neverAdoptsAStaleResultForAnotherContainer() {
+        properties.setQueryTimeoutMs(1_000);
+        properties.setResultWaitMs(500);
+        properties.setBaseUrl(baseUrl("/stale-result"));
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
+    }
+
     private static AgentErrorCode failure(TrackingOutcome outcome) {
         assertThat(outcome).isInstanceOf(TrackingOutcome.Failure.class);
         return ((TrackingOutcome.Failure) outcome).errorCode();
@@ -226,6 +286,11 @@ class MscProbeBrowserTest {
             case "/500" -> respond(exchange, 500, "server error");
             case "/submit-429" -> respond(exchange, 200, SUBMIT_FORM.formatted("fetch('/track-429')"));
             case "/submit-500" -> respond(exchange, 200, SUBMIT_FORM.formatted("fetch('/track-500')"));
+            case "/background-429" -> respond(exchange, 200, BACKGROUND_200_THEN_TRACK_429);
+            case "/background-500" -> respond(exchange, 200, BACKGROUND_500_THEN_RESULT);
+            case "/stale-result" -> respond(exchange, 200, STALE_OTHER_RESULT);
+            case "/config" -> respond(exchange, 200, "{\"ok\":true}");
+            case "/banner-500" -> respond(exchange, 500, "server error");
             case "/track-429" -> respond(exchange, 429, "too many requests");
             case "/track-500" -> respond(exchange, 500, "server error");
             case "/late-captcha" -> respond(exchange, 200, LATE_CAPTCHA_PAGE);

@@ -43,7 +43,7 @@ public final class EtaTextParser {
      * ignore the "+08:00".
      */
     private static final Pattern TIME = Pattern.compile(
-            "(?<!\\d)(\\d{1,2}):(\\d{2})(?::\\d{2})?\\s*"
+            "(?<!\\d)(\\d{1,2}):(\\d{2})(?::(\\d{2}))?\\s*"
                     + "(Z|(?:UTC|GMT)\\s*[+-]\\s*\\d{1,2}(?::?\\d{2})?"
                     + "|[+-]\\d{1,2}(?::?\\d{2})?"
                     + "|UTC|GMT|EST|EDT|PST|PDT|CET|CEST)\\b",
@@ -112,11 +112,31 @@ public final class EtaTextParser {
         }
         int hour = Integer.parseInt(matcher.group(1));
         int minute = Integer.parseInt(matcher.group(2));
-        if (hour > 23 || minute > 59) {
+        int second = matcher.group(3) == null ? 0 : Integer.parseInt(matcher.group(3));
+        if (hour > 23 || minute > 59 || second > 59) {
             return Optional.empty();
         }
-        Optional<String> zone = zoneOf(matcher.group(3));
-        return zone.map(value -> new ZonedTime(LocalTime.of(hour, minute), value));
+        Optional<String> zone = zoneOf(matcher.group(4));
+        return zone.map(value -> new ZonedTime(LocalTime.of(hour, minute, second), value));
+    }
+
+    /**
+     * Number of date-shaped values on a line. The ETA parser uses this to drop a
+     * line that prints two dates, because it cannot know which one belongs to
+     * the estimated-arrival clause.
+     */
+    public static int dateOccurrences(String text) {
+        if (text == null || text.isBlank()) {
+            return 0;
+        }
+        int count = 0;
+        for (Pattern pattern : DATE_PATTERNS) {
+            Matcher matcher = pattern.matcher(text);
+            while (matcher.find()) {
+                count++;
+            }
+        }
+        return count;
     }
 
     /**

@@ -91,6 +91,24 @@ class EtaTextParserTest {
     }
 
     @Test
+    void keepsTheSecondsThePagePrinted() {
+        EtaTextParser.ZonedTime time =
+                EtaTextParser.parseTime("2026-12-06T14:30:57+08:00").orElseThrow();
+        assertThat(time.time()).isEqualTo(java.time.LocalTime.of(14, 30, 57));
+
+        OffsetDateTime parsed = EtaTextParser.parseDateTime("2026-12-06T14:30:57+08:00").orElseThrow();
+        assertThat(parsed.toInstant()).isEqualTo(Instant.parse("2026-12-06T06:30:57Z"));
+    }
+
+    @Test
+    void countsDatesSoAmbiguousLinesCanBeDropped() {
+        assertThat(EtaTextParser.dateOccurrences("Estimated arrival at POD: Dec 06, 2026")).isEqualTo(1);
+        assertThat(EtaTextParser.dateOccurrences(
+                "Arrived 2026-11-20, ETA POD 2026-12-06")).isEqualTo(2);
+        assertThat(EtaTextParser.dateOccurrences("no date here")).isZero();
+    }
+
+    @Test
     void keepsAHalfHourOffsetAccurateEvenThoughItCannotBeNamedInIanaForm() {
         OffsetDateTime offset = EtaTextParser.parseDateTime("2026-12-06 14:30 UTC+05:30").orElseThrow();
         assertThat(offset.toInstant()).isEqualTo(Instant.parse("2026-12-06T09:00:00Z"));

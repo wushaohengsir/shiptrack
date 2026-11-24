@@ -39,8 +39,12 @@ final class LeaseBudget {
         return remainingMs() > Math.max(0, millis);
     }
 
-    /** Caps a configured timeout to what is left of the lease. */
+    /**
+     * Caps a configured timeout to what is left of the lease. Zero means the
+     * lease is spent and the caller must not start the request at all: flooring
+     * this to 1 ms would let an expired claim token reach the server.
+     */
     long timeoutMs(long configuredMs) {
-        return Math.max(1, Math.min(configuredMs, remainingMs()));
+        return Math.min(configuredMs, remainingMs());
     }
 }

@@ -49,23 +49,46 @@ public final class MscResultParser {
     private static final Pattern ETA_HINT = Pattern.compile(
             "(?i)\\b(eta|estimated|expected|planned|scheduled)\\b");
 
+    /**
+     * A departure is not an arrival. "Scheduled departure from Vancouver"
+     * carries forecast wording and a date, so it would otherwise be reported as
+     * the POD arrival.
+     */
+    private static final Pattern DEPARTURE_WORDING = Pattern.compile(
+            "(?i)\\b(departure|departs?|departed|sailing|sails?|etd|gate\\s*out)\\b");
+
+    /**
+     * Actual events are facts. When one line mixes an actual time with an
+     * estimate, the date cannot be bound to the estimate with confidence, so
+     * the line is dropped instead of guessing.
+     */
+    private static final Pattern ACTUAL_TIME_WORDING = Pattern.compile(
+            "(?i)\\b(actual|arrived|discharged|gate\\s*in|gate\\s*out|picked\\s+up|returned)\\b");
+
     private static final Pattern CONTAINER_TOKEN = Pattern.compile(
             "(?i)\\b([A-Z]{4}\\d{7})\\b");
 
     private static final int MAX_RAW_VALUE = 200;
 
     public ParsedTracking parse(MscPageSnapshot snapshot, String containerNo) {
-        String body = snapshot.bodyText() == null ? "" : snapshot.bodyText();
-        requireSameContainer(body, snapshot.eventLines(), containerNo);
+        // Only the result block this query produced may be read. The whole page
+        // can hold another container's result (a previous search, a highlighted
+        // demo row), and reporting it as this container's status is exactly the
+        // premature-stop bug AC-29 forbids.
+        String block = snapshot.resultBlockText();
+        if (block == null || block.isBlank()) {
+            throw new MscParseException("no visible result block for container " + containerNo);
+        }
+        requireExactlyOneContainer(block, containerNo);
 
-        String rawStatus = firstNonBlank(snapshot.statusText(), match(STATUS_LINE, body));
+        String rawStatus = firstNonBlank(snapshot.statusText(), match(STATUS_LINE, block));
         if (rawStatus == null) {
             throw new MscParseException("no status text found for container " + containerNo);
         }
 
-        String pol = match(POL, body);
-        String pod = match(POD, body);
-        String finalDestination = match(FINAL_DESTINATION, body);
+        String pol = match(POL, block);
+        String pod = match(POD, block);
+        String finalDestination = match(FINAL_DESTINATION, block);
 
         List<RawEvent> events = new ArrayList<>();
         for (String line : snapshot.eventLines()) {
@@ -83,13 +106,13 @@ public final class MscResultParser {
 
         return new ParsedTracking(
                 rawStatus,
-                match(LOCATION, body),
-                match(VESSEL, body),
-                match(VOYAGE, body),
+                match(LOCATION, block),
+                match(VESSEL, block),
+                match(VOYAGE, block),
                 pol,
                 pod,
                 finalDestination,
-                parseEtas(body, snapshot.eventLines(), pod, finalDestination),
+                parseEtas(block, snapshot.eventLines(), pod, finalDestination),
                 events);
     }
 
@@ -110,6 +133,14 @@ public final class MscResultParser {
         for (String candidate : candidates) {
             String line = candidate == null ? "" : candidate.trim();
             if (line.isEmpty() || !ETA_HINT.matcher(line).find()) {
+                continue;
+            }
+            if (!isArrivalForecast(line)) {
+                continue;
+            }
+            // Two dates on one line: the estimate cannot be bound to one value
+            // without guessing.
+            if (EtaTextParser.dateOccurrences(line) != 1) {
                 continue;
             }
             Optional<LocalDate> date = EtaTextParser.parseDate(line);
@@ -135,6 +166,22 @@ public final class MscResultParser {
         }
         conflicting.forEach(chosen::remove);
         return new ArrayList<>(chosen.values());
+    }
+
+    /**
+     * A usable ETA line forecasts an arrival and does not talk about a
+     * departure, a cancellation or something that already happened. Those
+     * categories print dates too, but publishing them as the POD arrival would
+     * end tracking on a wrong milestone.
+     */
+    private static boolean isArrivalForecast(String line) {
+        if (StatusWording.isCancelled(line)) {
+            return false;
+        }
+        if (DEPARTURE_WORDING.matcher(line).find()) {
+            return false;
+        }
+        return !ACTUAL_TIME_WORDING.matcher(line).find();
     }
 
     private static Optional<TrackedMilestone> etaMilestone(String line, String pod, String finalDestination) {
@@ -178,30 +225,24 @@ public final class MscResultParser {
     }
 
     /**
-     * Refuses a result block that belongs to another container. When the page
-     * prints no ISO 6346 token at all there is nothing to compare, and the
-     * status selector remains the only signal.
+     * The result block must name exactly one container, and it must be the one
+     * that was queried. No token means ownership is unknown; two tokens mean
+     * the block mixes results. Neither may be reported under this task.
      */
-    private static void requireSameContainer(String body, List<String> eventLines, String containerNo) {
+    private static void requireExactlyOneContainer(String block, String containerNo) {
         String expected = normalizeContainer(containerNo);
-        if (expected.isEmpty()) {
-            return;
-        }
-        StringBuilder haystack = new StringBuilder(body);
-        for (String line : eventLines) {
-            if (line != null) {
-                haystack.append('\n').append(line);
-            }
-        }
-        Matcher matcher = CONTAINER_TOKEN.matcher(haystack);
-        boolean sawToken = false;
+        Set<String> tokens = new HashSet<>();
+        Matcher matcher = CONTAINER_TOKEN.matcher(block);
         while (matcher.find()) {
-            sawToken = true;
-            if (normalizeContainer(matcher.group(1)).equals(expected)) {
-                return;
-            }
+            tokens.add(normalizeContainer(matcher.group(1)));
         }
-        if (sawToken) {
+        if (tokens.isEmpty()) {
+            throw new MscParseException("result block does not identify a container");
+        }
+        if (tokens.size() > 1) {
+            throw new MscParseException("result block shows more than one container");
+        }
+        if (!expected.isEmpty() && !tokens.contains(expected)) {
             throw new MscParseException("result page is for another container, not " + expected);
         }
     }

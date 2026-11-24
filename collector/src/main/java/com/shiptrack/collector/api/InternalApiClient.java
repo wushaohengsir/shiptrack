@@ -10,9 +10,16 @@ import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientException;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Minimal client for the two internal endpoints. It holds no database
@@ -37,9 +44,12 @@ public class InternalApiClient implements CollectorApi {
     }
 
     /**
-     * A report must not outlive the claim lease: both connect and read timeouts
-     * are capped to what is left. Building a client per call is cheap compared
-     * to the carrier query that produced the report.
+     * A report must not outlive the claim lease. {@code timeoutMs} is one
+     * absolute budget for sending the body and reading the whole response:
+     * connect and per-read timeouts are capped to it, and the call is also
+     * bounded on a worker thread so a server that drips JSON cannot stretch the
+     * total. Building a client per call is cheap compared to the carrier query
+     * that produced the report.
      */
     @Override
     public TrackingResultResponse report(TrackingResultReport report, long timeoutMs) {
@@ -52,12 +62,34 @@ public class InternalApiClient implements CollectorApi {
         requestFactory.setConnectTimeout(Duration.ofMillis(Math.max(1, effectiveConnect)));
         requestFactory.setReadTimeout(Duration.ofMillis(Math.max(1, effectiveRead)));
         RestClient client = builder.clone().requestFactory(requestFactory).build();
-        return client.post()
-                .uri("/internal/tracking-results")
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(report)
-                .retrieve()
-                .body(TrackingResultResponse.class);
+
+        ExecutorService executor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "report-http");
+            thread.setDaemon(true);
+            return thread;
+        });
+        try {
+            Future<TrackingResultResponse> pending = executor.submit(() -> client.post()
+                    .uri("/internal/tracking-results")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(report)
+                    .retrieve()
+                    .body(TrackingResultResponse.class));
+            return pending.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            throw new RestClientException("report did not finish within " + timeoutMs + "ms");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RestClientException("report interrupted");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new RestClientException("report failed: " + cause.getMessage(), cause);
+        } finally {
+            executor.shutdownNow();
+        }
     }
 
     private RestClient client(long timeoutMs) {

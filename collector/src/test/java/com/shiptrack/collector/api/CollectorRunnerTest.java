@@ -159,7 +159,10 @@ class CollectorRunnerTest {
         }).poll();
 
         assertThat(queries).hasValue(0);
+        // Zero carrier queries and zero report requests: no stale token leaves
+        // the process once the lease is spent.
         assertThat(api.reports).isEmpty();
+        assertThat(api.reportTimeouts).isEmpty();
     }
 
     private static void sleep(long millis) {

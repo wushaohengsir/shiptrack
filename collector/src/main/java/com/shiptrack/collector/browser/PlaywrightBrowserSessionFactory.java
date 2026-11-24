@@ -36,7 +36,12 @@ public class PlaywrightBrowserSessionFactory implements BrowserSessionFactory {
 
     @Override
     public synchronized BrowserSession open() {
-        ensureBrowser();
+        return open(properties.getActionTimeoutMs());
+    }
+
+    @Override
+    public synchronized BrowserSession open(long timeoutMs) {
+        ensureBrowser(timeoutMs);
         BrowserContext context = browser.newContext(new Browser.NewContextOptions()
                 .setUserAgent(properties.getUserAgent())
                 .setViewportSize(properties.getViewportWidth(), properties.getViewportHeight())
@@ -61,12 +66,12 @@ public class PlaywrightBrowserSessionFactory implements BrowserSessionFactory {
         }
     }
 
-    private void ensureBrowser() {
+    private void ensureBrowser(long timeoutMs) {
         if (browser != null) {
             return;
         }
         playwright = Playwright.create();
-        browser = playwright.chromium().launch(launchOptions());
+        browser = playwright.chromium().launch(launchOptions(timeoutMs));
         log.info("Chromium launched (headless={}, sandbox=true, version={})",
                 properties.isHeadless(), browser.version());
     }
@@ -78,9 +83,19 @@ public class PlaywrightBrowserSessionFactory implements BrowserSessionFactory {
      * supplies {@code shm_size} instead.
      */
     BrowserType.LaunchOptions launchOptions() {
+        return launchOptions(properties.getActionTimeoutMs());
+    }
+
+    /**
+     * The launch timeout is capped by the caller's remaining query budget, so a
+     * cold or hung Chromium start cannot consume more than the 30 s the query
+     * is allowed.
+     */
+    BrowserType.LaunchOptions launchOptions(long timeoutMs) {
         return new BrowserType.LaunchOptions()
                 .setHeadless(properties.isHeadless())
                 .setChromiumSandbox(true)
+                .setTimeout(timeoutMs <= 0 ? 1 : timeoutMs)
                 .setIgnoreDefaultArgs(List.of("--disable-dev-shm-usage"));
     }
 

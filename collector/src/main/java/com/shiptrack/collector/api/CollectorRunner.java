@@ -171,13 +171,14 @@ public class CollectorRunner {
         int maxAttempts = Math.max(1, properties.getReportMaxAttempts());
         long backoff = Math.max(0, properties.getReportBackoffMs());
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            if (lease.expired()) {
+            long budget = lease.timeoutMs(properties.getReadTimeoutMs());
+            if (budget <= 0) {
                 log.warn("Lease expired before report attempt {} for container_id={}; "
                         + "task will be reclaimed", attempt, task.containerId());
                 return;
             }
             try {
-                api.report(report, lease.timeoutMs(properties.getReadTimeoutMs()));
+                api.report(report, budget);
                 log.info("Reported run_id={} container_id={} success={} retry={}",
                         runId, task.containerId(), report.success(), report.retryCount());
                 return;
