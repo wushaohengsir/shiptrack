@@ -1,0 +1,99 @@
+# Single-host deployment: the API plus its MySQL 8.4 database.
+#
+#   cd deploy
+#   cp .env.example .env        # then fill every change-me value
+#   docker compose up -d mysql
+#   docker compose --profile migrate run --rm migrate
+#   docker compose up -d app
+#
+# Every secret is read from deploy/.env (git-ignored); nothing is baked into
+# an image and the database port is published on 127.0.0.1 only.
+
+name: shiptrack
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in deploy/.env}
+      # No root account reachable from other containers; bootstrap runs over the socket.
+      MYSQL_ROOT_HOST: localhost
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-shiptrack}
+      # Read by mysql-init/01-create-users.sh, not by the MySQL entrypoint.
+      DB_MIGRATION_USER: ${DB_MIGRATION_USER:-shiptrack_migrate}
+      DB_MIGRATION_PASSWORD: ${DB_MIGRATION_PASSWORD:?set DB_MIGRATION_PASSWORD in deploy/.env}
+      DB_APP_USER: ${DB_APP_USER:-shiptrack_app}
+      DB_APP_PASSWORD: ${DB_APP_PASSWORD:?set DB_APP_PASSWORD in deploy/.env}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    ports:
+      # Loopback only: the database must never be reachable from the internet.
+      - "127.0.0.1:${MYSQL_HOST_PORT:-3306}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # One-shot Flyway migration. Uses the DDL account and exits; the API never
+  # migrates and never holds DDL credentials.
+  migrate:
+    profiles: ["migrate"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: shiptrack-api:${APP_IMAGE_TAG:-local}
+    restart: "no"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_URL: "jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-shiptrack}?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC&useSSL=false&allowPublicKeyRetrieval=true"
+      DB_MIGRATION_USER: ${DB_MIGRATION_USER:-shiptrack_migrate}
+      DB_MIGRATION_PASSWORD: ${DB_MIGRATION_PASSWORD:?set DB_MIGRATION_PASSWORD in deploy/.env}
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:--Xms128m -Xmx256m}
+      TZ: ${TZ:-Asia/Shanghai}
+    command: ["--spring.profiles.active=migrate"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: shiptrack-api:${APP_IMAGE_TAG:-local}
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_URL: "jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-shiptrack}?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC&useSSL=false&allowPublicKeyRetrieval=true"
+      DB_USER: ${DB_APP_USER:-shiptrack_app}
+      DB_PASSWORD: ${DB_APP_PASSWORD:?set DB_APP_PASSWORD in deploy/.env}
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:--Xms256m -Xmx512m}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "${APP_HOST_PORT:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 30s
+
+volumes:
+  mysql-data:
