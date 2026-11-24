@@ -34,6 +34,11 @@ class MigrateDataSourceConfiguration {
         String username = environment.getProperty("DB_MIGRATION_USER");
         String password = environment.getProperty("DB_MIGRATION_PASSWORD");
 
+        // Re-check at the point of construction: HikariConfig's no-arg constructor reads
+        // hikaricp.configurationFile, so a property set after the guard ran must still
+        // stop the bean from being built.
+        MigrateCredentialGuardConfiguration.requireNoHikariConfigurationFile(environment);
+
         // The no-arg constructor keeps the pool lazy: a missing database then fails when
         // Flyway upgrades, not while the application context is being built.
         HikariDataSource dataSource = new HikariDataSource();

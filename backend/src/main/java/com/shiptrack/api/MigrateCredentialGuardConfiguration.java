@@ -43,6 +43,10 @@ import java.util.function.Predicate;
  *       {@code dataSourceClassName}/{@code dataSourceProperties} family must be absent:
  *       Hikari would otherwise instantiate that class and connect with its own URL and
  *       properties instead of the guarded datasource.</li>
+ *   <li>The {@code hikaricp.configurationFile} JVM system property must be absent:
+ *       Hikari's no-arg configuration constructor loads that external file, which can
+ *       set {@code dataSourceClassName}, {@code jdbcUrl} or credentials without passing
+ *       through any guarded property.</li>
  * </ol>
  */
 @Configuration(proxyBeanMethods = false)
@@ -60,6 +64,7 @@ class MigrateCredentialGuardConfiguration {
     private static final String FLYWAY_PASSWORD_PROPERTY = "spring.flyway.password";
     private static final String DATASOURCE_TYPE_PROPERTY = "spring.datasource.type";
     private static final String HIKARI_DATA_SOURCE_PROPERTY = "spring.datasource.hikari.data-source";
+    private static final String HIKARI_CONFIGURATION_FILE_PROPERTY = "hikaricp.configurationFile";
     private static final String USERNAME_VARIABLE = "DB_MIGRATION_USER";
     private static final String PASSWORD_VARIABLE = "DB_MIGRATION_PASSWORD";
 
@@ -88,7 +93,29 @@ class MigrateCredentialGuardConfiguration {
             requireAbsent(environment, FLYWAY_PASSWORD_PROPERTY);
             requireAbsent(environment, DATASOURCE_TYPE_PROPERTY);
             requireAbsentPrefix(environment, HIKARI_DATA_SOURCE_PROPERTY);
+
+            // HikariConfig's no-arg constructor loads this external file before any
+            // setter runs, so it could silently replace the driver, URL or account.
+            requireNoHikariConfigurationFile(environment);
         };
+    }
+
+    /**
+     * Rejects Hikari's global configuration-file entry point.
+     *
+     * <p>{@code new HikariDataSource()} delegates to the no-arg {@code HikariConfig}
+     * constructor, which reads the {@code hikaricp.configurationFile} JVM system property
+     * and loads that file into the pool configuration. The file can carry
+     * {@code dataSourceClassName}, {@code jdbcUrl}, {@code username}/{@code password} or
+     * driver-level properties, none of which pass through the guarded Spring properties.
+     * The live system property is checked directly, and the environment scan also catches
+     * relaxed spellings (environment variable or command line) that Boot would expose.
+     */
+    static void requireNoHikariConfigurationFile(Environment environment) {
+        if (System.getProperty(HIKARI_CONFIGURATION_FILE_PROPERTY) != null) {
+            throw forbiddenProperty(HIKARI_CONFIGURATION_FILE_PROPERTY);
+        }
+        requireAbsent(environment, HIKARI_CONFIGURATION_FILE_PROPERTY);
     }
 
     /** The migration variable must be set and non-blank, wherever it resolves from. */

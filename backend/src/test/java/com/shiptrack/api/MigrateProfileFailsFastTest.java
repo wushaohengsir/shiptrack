@@ -32,7 +32,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * {@code data-source}, {@code data-source-class-name}, {@code data-source-properties.*})
  * is rejected too, and the URL must match the project form: host/port/database plus
  * approved parameters, so host-level attributes and percent-encoded credential keys
- * cannot reach the driver.
+ * cannot reach the driver. Hikari's global {@code hikaricp.configurationFile} system
+ * property is rejected as well, since its no-arg configuration constructor would load
+ * that file before any guarded setter runs.
  */
 class MigrateProfileFailsFastTest {
 
@@ -92,6 +94,11 @@ class MigrateProfileFailsFastTest {
             "migrate profile forbids spring.datasource.hikari.data-source;"
                     + " the migration must use the single datasource configured by DB_MIGRATION_USER"
                     + " and DB_MIGRATION_PASSWORD";
+    private static final String FORBIDDEN_HIKARI_CONFIGURATION_FILE_MESSAGE =
+            "migrate profile forbids hikaricp.configurationFile;"
+                    + " the migration must use the single datasource configured by DB_MIGRATION_USER"
+                    + " and DB_MIGRATION_PASSWORD";
+    private static final String HIKARI_CONFIGURATION_FILE_PROPERTY = "hikaricp.configurationFile";
 
     @Test
     void missingMigrationUserAbortsStartup() {
@@ -352,6 +359,39 @@ class MigrateProfileFailsFastTest {
     }
 
     @Test
+    void hikariConfigurationFileSystemPropertyIsRejected() {
+        // HikariConfig's no-arg constructor loads the file named by this JVM system
+        // property, which can set dataSourceClassName, jdbcUrl or credentials directly
+        // (R-B3-3 follow-up). The property is set on the running JVM on purpose: the
+        // environment property name alone would not prove the real Hikari path is closed.
+        String previous = System.getProperty(HIKARI_CONFIGURATION_FILE_PROPERTY);
+        System.setProperty(HIKARI_CONFIGURATION_FILE_PROPERTY, "/tmp/hikari-bypass.properties");
+        try {
+            assertGuardRejects(completeCredentials(), FORBIDDEN_HIKARI_CONFIGURATION_FILE_MESSAGE);
+        } finally {
+            restoreSystemProperty(HIKARI_CONFIGURATION_FILE_PROPERTY, previous);
+        }
+    }
+
+    @Test
+    void hikariConfigurationFileCommandLinePropertyIsRejected() {
+        assertGuardRejects(
+                completeCredentials(),
+                FORBIDDEN_HIKARI_CONFIGURATION_FILE_MESSAGE,
+                "--hikaricp.configurationFile=/tmp/hikari-bypass.properties");
+    }
+
+    @Test
+    void relaxedHikariConfigurationFileSpellingIsRejected() {
+        // The environment-variable spelling Hikari-adjacent configuration sometimes uses;
+        // normalisation makes it match the canonical system property name.
+        assertGuardRejects(
+                completeCredentials(),
+                FORBIDDEN_HIKARI_CONFIGURATION_FILE_MESSAGE,
+                "--HIKARICP_CONFIGURATION_FILE=/tmp/hikari-bypass.properties");
+    }
+
+    @Test
     void standardDatasourceUrlWithConnectionParametersStarts() {
         // A URL with ordinary driver parameters is legitimate; the guard must not
         // mistake them for credentials. Flyway is disabled so the context starts
@@ -373,6 +413,14 @@ class MigrateProfileFailsFastTest {
     private static Map<String, Object> completeCredentials() {
         return Map.of("DB_MIGRATION_USER", MIGRATION_USER,
                 "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD);
+    }
+
+    private static void restoreSystemProperty(String name, String previous) {
+        if (previous == null) {
+            System.clearProperty(name);
+        } else {
+            System.setProperty(name, previous);
+        }
     }
 
     private static void assertGuardRejects(
