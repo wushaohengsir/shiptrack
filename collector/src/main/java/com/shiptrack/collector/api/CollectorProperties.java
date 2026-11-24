@@ -29,6 +29,15 @@ public class CollectorProperties {
     private String queryZone = "Asia/Shanghai";
     private int connectTimeoutMs = 5_000;
     private int readTimeoutMs = 30_000;
+    /**
+     * Server-side lease of a claimed task ({@code TASK_CLAIM_TIMEOUT}, §5.22,
+     * default 15 minutes). The collector starts the clock before the claim
+     * request and stops using the claim token before this runs out, so a slow
+     * query or report retry never competes with the server's reclaim.
+     */
+    private long leaseDurationMs = 900_000;
+    /** Safety margin kept free at the end of the lease. */
+    private long leaseSafetyMarginMs = 5_000;
 
     public String getBaseUrl() {
         return baseUrl;
@@ -132,5 +141,21 @@ public class CollectorProperties {
 
     public void setReadTimeoutMs(int readTimeoutMs) {
         this.readTimeoutMs = readTimeoutMs;
+    }
+
+    public long getLeaseDurationMs() {
+        return leaseDurationMs;
+    }
+
+    public void setLeaseDurationMs(long leaseDurationMs) {
+        this.leaseDurationMs = leaseDurationMs;
+    }
+
+    public long getLeaseSafetyMarginMs() {
+        return leaseSafetyMarginMs;
+    }
+
+    public void setLeaseSafetyMarginMs(long leaseSafetyMarginMs) {
+        this.leaseSafetyMarginMs = leaseSafetyMarginMs;
     }
 }

@@ -156,6 +156,54 @@ class MscResultParserTest {
     }
 
     @Test
+    void anActualArrivalIsAFactAndNotAnEta() {
+        String body = """
+                Container MSDU7172233
+                Status: Discharged from vessel
+                Port of Discharge: Vancouver, CA
+                Actual arrival at Vancouver on 2026-11-21
+                """;
+        ParsedTracking parsed = parser.parse(snapshot(body, null, List.of()), "MSDU7172233");
+        assertThat(parsed.etas()).isEmpty();
+    }
+
+    @Test
+    void dropsALineThatNamesBothThePodAndTheFinalDestination() {
+        String body = """
+                Container MSDU7172233
+                Status: Discharged from vessel
+                Port of Discharge: Vancouver, CA
+                Final Destination: Toronto, CA
+                ETA Vancouver (POD) and final destination Toronto on 2026-12-06
+                """;
+        ParsedTracking parsed = parser.parse(snapshot(body, null, List.of()), "MSDU7172233");
+        assertThat(parsed.etas()).isEmpty();
+    }
+
+    @Test
+    void matchesAPortNameOnlyAsAWholeWord() {
+        String body = """
+                Container MSDU7172233
+                Status: Loaded on vessel
+                Port of Discharge: Vancouver, CA
+                ETA at Vancouverville terminal: 2026-12-06
+                """;
+        ParsedTracking parsed = parser.parse(snapshot(body, null, List.of()), "MSDU7172233");
+        assertThat(parsed.etas()).isEmpty();
+    }
+
+    @Test
+    void refusesAResultThatBelongsToAnotherContainer() {
+        String body = """
+                Container MSKU1234567
+                Status: Container picked up
+                """;
+        assertThatThrownBy(() -> parser.parse(snapshot(body, null, List.of()), "MSDU7172233"))
+                .isInstanceOf(MscParseException.class)
+                .hasMessageContaining("another container");
+    }
+
+    @Test
     void failsWhenNoStatusWasRendered() {
         assertThatThrownBy(() -> parser.parse(snapshot("Container MSDU7172233\n", null, List.of()), "MSDU7172233"))
                 .isInstanceOf(MscParseException.class)

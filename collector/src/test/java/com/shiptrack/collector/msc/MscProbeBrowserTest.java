@@ -53,6 +53,36 @@ class MscProbeBrowserTest {
             </body></html>
             """;
 
+    private static final String SUBMIT_FORM = """
+            <html><body>
+            <form onsubmit="%s;return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            </body></html>
+            """;
+
+    private static final String LATE_CAPTCHA_PAGE = SUBMIT_FORM.formatted(
+            "setTimeout(function(){var d=document.createElement('div');"
+                    + "d.textContent='Please verify you are human';"
+                    + "document.body.appendChild(d);},300)");
+
+    private static final String LATE_LOGIN_PAGE = SUBMIT_FORM.formatted(
+            "setTimeout(function(){var i=document.createElement('input');"
+                    + "i.type='password';document.body.appendChild(i);},300)");
+
+    private static final String SLOW_RESULT_PAGE = """
+            <html><body>
+            <form onsubmit="setTimeout(function(){
+              document.getElementById('status').textContent='Status: Loaded on vessel';
+              document.getElementById('result').style.display='block';},5000);return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result" style="display:none"><div id="status"></div></div>
+            </body></html>
+            """;
+
     private HttpServer server;
     private PlaywrightBrowserSessionFactory factory;
     private MscProperties properties;
@@ -143,6 +173,38 @@ class MscProbeBrowserTest {
         assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
     }
 
+    @Test
+    void classifiesATrackingRequest429EvenWhenThePageShowsNothing() {
+        properties.setBaseUrl(baseUrl("/submit-429"));
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.RATE_LIMITED);
+    }
+
+    @Test
+    void classifiesATrackingRequest5xxEvenWhenThePageShowsNothing() {
+        properties.setBaseUrl(baseUrl("/submit-500"));
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.SOURCE_UNAVAILABLE);
+    }
+
+    @Test
+    void classifiesACaptchaThatOnlyAppearsAfterSubmit() {
+        properties.setBaseUrl(baseUrl("/late-captcha"));
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.CAPTCHA_REQUIRED);
+    }
+
+    @Test
+    void classifiesALoginThatOnlyAppearsAfterSubmit() {
+        properties.setBaseUrl(baseUrl("/late-login"));
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.LOGIN_REQUIRED);
+    }
+
+    @Test
+    void reportsAResultThatNeverRendersAsTimeout() {
+        properties.setQueryTimeoutMs(1_000);
+        properties.setResultWaitMs(10_000);
+        properties.setBaseUrl(baseUrl("/slow-result"));
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
+    }
+
     private static AgentErrorCode failure(TrackingOutcome outcome) {
         assertThat(outcome).isInstanceOf(TrackingOutcome.Failure.class);
         return ((TrackingOutcome.Failure) outcome).errorCode();
@@ -162,6 +224,13 @@ class MscProbeBrowserTest {
                     "<html><body><form><input type=\"password\"></form></body></html>");
             case "/429" -> respond(exchange, 429, "too many requests");
             case "/500" -> respond(exchange, 500, "server error");
+            case "/submit-429" -> respond(exchange, 200, SUBMIT_FORM.formatted("fetch('/track-429')"));
+            case "/submit-500" -> respond(exchange, 200, SUBMIT_FORM.formatted("fetch('/track-500')"));
+            case "/track-429" -> respond(exchange, 429, "too many requests");
+            case "/track-500" -> respond(exchange, 500, "server error");
+            case "/late-captcha" -> respond(exchange, 200, LATE_CAPTCHA_PAGE);
+            case "/late-login" -> respond(exchange, 200, LATE_LOGIN_PAGE);
+            case "/slow-result" -> respond(exchange, 200, SLOW_RESULT_PAGE);
             case "/slow" -> {
                 try {
                     Thread.sleep(1_500);

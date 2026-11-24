@@ -16,8 +16,11 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 
@@ -104,23 +107,40 @@ public class StatusMappingsLoader {
     private Loaded readValidated() {
         try {
             FileIdentity before = readIdentity();
-            StatusMappingsDto dto = yaml.readValue(path.toFile(), StatusMappingsDto.class);
-            StatusMappingSet set = validate(dto);
-            FileIdentity after = readIdentity();
+            byte[] content = Files.readAllBytes(path);
+            FileIdentity after = identityOf(content);
             if (!before.equals(after)) {
                 // The API may have atomically replaced the file while we read.
                 // Retry on the next tick rather than pairing one version's
                 // rules with another version's identity.
                 throw new IllegalStateException("status mappings changed while reading");
             }
+            StatusMappingsDto dto = yaml.readValue(content, StatusMappingsDto.class);
+            StatusMappingSet set = validate(dto);
             return new Loaded(set, after);
         } catch (IOException e) {
             throw new IllegalStateException("cannot read status mappings from " + path + ": " + e.getMessage(), e);
         }
     }
 
+    /**
+     * mtime and size alone miss a same-length replacement that restores the
+     * timestamp, so the digest of the bytes is part of the identity.
+     */
     private FileIdentity readIdentity() throws IOException {
-        return new FileIdentity(Files.getLastModifiedTime(path), Files.size(path));
+        return identityOf(Files.readAllBytes(path));
+    }
+
+    private FileIdentity identityOf(byte[] content) throws IOException {
+        return new FileIdentity(Files.getLastModifiedTime(path), content.length, sha256(content));
+    }
+
+    private static String sha256(byte[] content) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(content));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is not available", e);
+        }
     }
 
     private static void validateTransition(StatusMappingSet existing, StatusMappingSet loaded) {
@@ -176,7 +196,7 @@ public class StatusMappingsLoader {
         return carrier + '\u0000' + StatusMappingSet.normalizeText(mapping.match()) + '\u0000' + mapping.priority();
     }
 
-    private record FileIdentity(FileTime lastModified, long size) {
+    private record FileIdentity(FileTime lastModified, long size, String sha256) {
     }
 
     private record Loaded(StatusMappingSet set, FileIdentity identity) {

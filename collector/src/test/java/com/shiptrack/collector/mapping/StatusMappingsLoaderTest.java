@@ -122,6 +122,31 @@ class StatusMappingsLoaderTest {
     }
 
     @Test
+    void detectsASameLengthSameTimestampReplacement() throws IOException {
+        Path file = write(1, "Gate in", "GATE_IN", 90);
+        StatusMappingsLoader loader = new StatusMappingsLoader(file.toString());
+        loader.loadOnStartup();
+        FileTime original = Files.getLastModifiedTime(file);
+
+        // Same byte length and the timestamp restored: mtime+size alone would
+        // miss this, the content digest must not.
+        Files.writeString(file, """
+                version: 2
+                updated_at: "2026-11-24T20:05:00+08:00"
+                mappings:
+                  - carrier: MSC
+                    match: "Gate em"
+                    transport_status: GATE_IN
+                    priority: 90
+                """);
+        Files.setLastModifiedTime(file, original);
+
+        StatusMappingSet reloaded = loader.refreshAndGet();
+        assertThat(reloaded.version()).isEqualTo(2);
+        assertThat(reloaded.normalize("MSC", "Gate em")).isEqualTo(TransportStatus.GATE_IN);
+    }
+
+    @Test
     void rejectsRulesThatDisagreeAtTheSamePriority() throws IOException {
         Path file = write(() -> """
                 version: 1

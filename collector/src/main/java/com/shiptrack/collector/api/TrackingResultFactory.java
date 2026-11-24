@@ -5,6 +5,7 @@ import com.shiptrack.collector.msc.MscPageSnapshot;
 import com.shiptrack.collector.msc.ParsedTracking;
 import com.shiptrack.collector.msc.RawEta;
 import com.shiptrack.collector.msc.RawEvent;
+import com.shiptrack.collector.msc.StatusWording;
 import com.shiptrack.collector.msc.TrackingOutcome;
 import com.shiptrack.contract.dto.Eta;
 import com.shiptrack.contract.dto.SourceEvent;
@@ -16,11 +17,11 @@ import org.springframework.stereotype.Component;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Pattern;
 
 /**
  * Turns an attempt into the exact report body of §5.23. The mapping snapshot is
@@ -32,14 +33,6 @@ public class TrackingResultFactory {
 
     private static final String SOURCE = "msc_web";
     private static final int MAX_ERROR_MESSAGE = 1_000;
-
-    /**
-     * A status line that only talks about an estimate is not an actual state.
-     * Reporting "estimated arrival at POD" as ARRIVED_POD would stop tracking
-     * before the ship has arrived.
-     */
-    private static final Pattern PLANNED_WORDING =
-            Pattern.compile("(?i)\\b(estimated|expected|planned|scheduled|eta)\\b");
 
     public TrackingResultReport build(String runId,
                                       ClaimedTaskDto task,
@@ -62,7 +55,12 @@ public class TrackingResultFactory {
                                                OffsetDateTime queriedAt) {
         ParsedTracking parsed = success.parsed();
         String carrier = task.carrier();
-        TransportStatus status = isPlannedWording(parsed.rawStatus())
+        // A plan and a cancellation both describe something that is not an
+        // actual state. Using the same wording rules as the timeline is what
+        // keeps "Container picked up cancelled" out of the terminal PICKED_UP
+        // status (AC-29) while its event is still reported as CANCELLED.
+        TransportStatus status = StatusWording.isPlanned(parsed.rawStatus())
+                || StatusWording.isCancelled(parsed.rawStatus())
                 ? TransportStatus.UNKNOWN
                 : mappings.normalize(carrier, parsed.rawStatus());
 
@@ -148,6 +146,12 @@ public class TrackingResultFactory {
         if (raw.time() != null && raw.timezone() != null) {
             try {
                 ZoneId zone = ZoneId.of(raw.timezone());
+                if (zone instanceof ZoneOffset) {
+                    // §3.3 wants an IANA zone name. A half-hour offset such as
+                    // +05:30 has no fixed-offset IANA name, so the value is
+                    // downgraded to DATE instead of publishing a non-IANA id.
+                    return dateOnlyEta(raw);
+                }
                 return new Eta(
                         raw.milestone(),
                         raw.rawValue(),
@@ -160,6 +164,10 @@ public class TrackingResultFactory {
                 // Unknown zone: keep the date-only value instead of guessing.
             }
         }
+        return dateOnlyEta(raw);
+    }
+
+    private static Eta dateOnlyEta(RawEta raw) {
         return new Eta(
                 raw.milestone(),
                 raw.rawValue(),
@@ -182,10 +190,6 @@ public class TrackingResultFactory {
                 null,
                 null,
                 text);
-    }
-
-    private static boolean isPlannedWording(String text) {
-        return text != null && PLANNED_WORDING.matcher(text).find();
     }
 
     private static Map<String, Object> rawPayload(MscPageSnapshot page) {

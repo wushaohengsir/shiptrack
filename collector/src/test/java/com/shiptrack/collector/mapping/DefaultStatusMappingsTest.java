@@ -19,6 +19,9 @@ class DefaultStatusMappingsTest {
         StatusMappingsLoader loader = new StatusMappingsLoader(shippedMappingFile().toString());
         loader.loadOnStartup();
 
+        // The empty-container re-rank shipped as v2 so a live mount with v1
+        // can hot-switch instead of being rejected as a same-version change.
+        assertThat(loader.snapshot().version()).isEqualTo(2);
         assertThat(loader.snapshot().normalize("MSC", "Empty container picked up"))
                 .isEqualTo(TransportStatus.EMPTY_PICKED_UP);
         assertThat(loader.snapshot().normalize("MSC", "Empty pick up at Ningbo"))

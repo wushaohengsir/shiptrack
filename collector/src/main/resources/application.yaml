@@ -22,6 +22,9 @@ collector:
   query-zone: ${COLLECTOR_QUERY_ZONE:Asia/Shanghai}
   connect-timeout-ms: ${COLLECTOR_CONNECT_TIMEOUT_MS:5000}
   read-timeout-ms: ${COLLECTOR_READ_TIMEOUT_MS:30000}
+  # §5.22: keep the collector's own clock no longer than the server lease.
+  lease-duration-ms: ${TASK_CLAIM_TIMEOUT_MS:900000}
+  lease-safety-margin-ms: ${COLLECTOR_LEASE_SAFETY_MARGIN_MS:5000}
 
   # Read-only mount; the API owns this file and bumps `version` on every change.
   mapping-path: ${MAPPING_PATH:/app/config/status-mappings.yaml}

@@ -106,6 +106,59 @@ class TrackingResultFactoryTest {
     }
 
     @Test
+    void aCancelledPickupNeverBecomesTheTerminalStatus() {
+        StatusMappingSet pickup = new StatusMappingSet(2, List.of(
+                new StatusMapping("MSC", "Container picked up", TransportStatus.PICKED_UP, 90)));
+        ParsedTracking parsed = new ParsedTracking(
+                "Container picked up cancelled", null, null, null, null, null, null,
+                List.of(),
+                List.of(new RawEvent("Container picked up cancelled", EventTimeType.CANCELLED,
+                        OffsetDateTime.parse("2026-11-24T09:00:00+08:00"), "Etc/GMT-8")));
+
+        TrackingResultReport report = factory.build("run_1", task, pickup,
+                new TrackingOutcome.Success(parsed, page()), 0, QUERIED_AT);
+
+        // AC-29: a cancellation must not look like the terminal pickup, or the
+        // API would stop tracking the container.
+        assertThat(report.rawStatus()).isEqualTo("Container picked up cancelled");
+        assertThat(report.transportStatus()).isEqualTo(TransportStatus.UNKNOWN);
+        assertThat(report.sourceEvents()).singleElement()
+                .satisfies(event -> assertThat(event.eventTimeType()).isEqualTo(EventTimeType.CANCELLED));
+    }
+
+    @Test
+    void anActualPickupStillBecomesTheTerminalStatus() {
+        StatusMappingSet pickup = new StatusMappingSet(2, List.of(
+                new StatusMapping("MSC", "Container picked up", TransportStatus.PICKED_UP, 90)));
+        ParsedTracking parsed = new ParsedTracking(
+                "Container picked up", null, null, null, null, null, null, List.of(), List.of());
+
+        TrackingResultReport report = factory.build("run_1", task, pickup,
+                new TrackingOutcome.Success(parsed, page()), 0, QUERIED_AT);
+
+        assertThat(report.transportStatus()).isEqualTo(TransportStatus.PICKED_UP);
+    }
+
+    @Test
+    void aHalfHourZoneIsDowngradedToDatePrecisionBecauseTheContractWantsIanaNames() {
+        ParsedTracking parsed = new ParsedTracking(
+                "Loaded on vessel", null, null, null, null, null, null,
+                List.of(new RawEta(TrackedMilestone.POD_ARRIVAL, "06 Dec 2026 14:30 +05:30",
+                        LocalDate.of(2026, 12, 6), LocalTime.of(14, 30), "+05:30")),
+                List.of());
+
+        TrackingResultReport report = factory.build("run_1", task, mappings,
+                new TrackingOutcome.Success(parsed, page()), 0, QUERIED_AT);
+
+        assertThat(report.etas()).singleElement().satisfies(eta -> {
+            assertThat(eta.precision()).isEqualTo(EtaPrecision.DATE);
+            assertThat(eta.time()).isNull();
+            assertThat(eta.timezone()).isNull();
+            assertThat(eta.utcAt()).isNull();
+        });
+    }
+
+    @Test
     void copiesEventTimestampAndTimeSemantics() {
         OffsetDateTime occurredAt = OffsetDateTime.parse("2026-11-21T16:20:00+01:00");
         ParsedTracking parsed = new ParsedTracking(

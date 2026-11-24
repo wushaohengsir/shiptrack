@@ -36,6 +36,16 @@ class MscProbeClassifyTest {
     }
 
     @Test
+    void acceptsATrackingCallOnAnotherSubdomainOfTheCarrier() {
+        assertThat(MscProbe.sameDomain("api.msc.com", "www.msc.com")).isTrue();
+        assertThat(MscProbe.sameDomain("www.msc.com", "www.msc.com")).isTrue();
+        assertThat(MscProbe.sameDomain("tracking.example.org", "www.msc.com")).isFalse();
+        assertThat(MscProbe.sameDomain("127.0.0.1", "127.0.0.1")).isTrue();
+        assertThat(MscProbe.sameDomain("127.0.0.2", "127.0.0.1")).isFalse();
+        assertThat(MscProbe.sameDomain(null, "www.msc.com")).isFalse();
+    }
+
+    @Test
     void refusesAQueryBudgetAboveThirtySeconds() {
         MscProperties properties = new MscProperties();
         properties.setQueryTimeoutMs(60_000);

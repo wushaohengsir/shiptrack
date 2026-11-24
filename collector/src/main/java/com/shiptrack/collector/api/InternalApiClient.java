@@ -21,19 +21,50 @@ import java.util.List;
 @Component
 public class InternalApiClient implements CollectorApi {
 
+    private final RestClient.Builder builder;
+    private final int connectTimeoutMs;
+    private final int readTimeoutMs;
     private final RestClient restClient;
 
     public InternalApiClient(CollectorProperties properties) {
-        SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
-        requestFactory.setConnectTimeout(Duration.ofMillis(properties.getConnectTimeoutMs()));
-        requestFactory.setReadTimeout(Duration.ofMillis(properties.getReadTimeoutMs()));
-
-        this.restClient = RestClient.builder()
+        this.connectTimeoutMs = properties.getConnectTimeoutMs();
+        this.readTimeoutMs = properties.getReadTimeoutMs();
+        this.builder = RestClient.builder()
                 .baseUrl(trimTrailingSlash(properties.getBaseUrl()))
-                .requestFactory(requestFactory)
                 .defaultHeader("X-Internal-Token", properties.getInternalToken())
-                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
-                .build();
+                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE);
+        this.restClient = client(properties.getReadTimeoutMs());
+    }
+
+    /**
+     * A report must not outlive the claim lease: both connect and read timeouts
+     * are capped to what is left. Building a client per call is cheap compared
+     * to the carrier query that produced the report.
+     */
+    @Override
+    public TrackingResultResponse report(TrackingResultReport report, long timeoutMs) {
+        if (timeoutMs <= 0) {
+            throw new IllegalStateException("no lease time left to report");
+        }
+        int effectiveRead = (int) Math.min(readTimeoutMs, timeoutMs);
+        int effectiveConnect = (int) Math.min(connectTimeoutMs, timeoutMs);
+        SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
+        requestFactory.setConnectTimeout(Duration.ofMillis(Math.max(1, effectiveConnect)));
+        requestFactory.setReadTimeout(Duration.ofMillis(Math.max(1, effectiveRead)));
+        RestClient client = builder.clone().requestFactory(requestFactory).build();
+        return client.post()
+                .uri("/internal/tracking-results")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(report)
+                .retrieve()
+                .body(TrackingResultResponse.class);
+    }
+
+    private RestClient client(long timeoutMs) {
+        SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
+        requestFactory.setConnectTimeout(Duration.ofMillis(connectTimeoutMs));
+        requestFactory.setReadTimeout(Duration.ofMillis(timeoutMs));
+        return builder.clone().requestFactory(requestFactory).build();
     }
 
     @Override
@@ -61,12 +92,7 @@ public class InternalApiClient implements CollectorApi {
 
     @Override
     public TrackingResultResponse report(TrackingResultReport report) {
-        return restClient.post()
-                .uri("/internal/tracking-results")
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(report)
-                .retrieve()
-                .body(TrackingResultResponse.class);
+        return report(report, readTimeoutMs);
     }
 
     private static String trimTrailingSlash(String value) {

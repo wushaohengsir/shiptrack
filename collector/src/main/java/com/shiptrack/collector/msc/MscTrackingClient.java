@@ -7,4 +7,12 @@ package com.shiptrack.collector.msc;
 public interface MscTrackingClient {
 
     TrackingOutcome query(String containerNo);
+
+    /**
+     * Queries with an upper bound on the whole attempt. The caller passes the
+     * remaining lease, so one slow carrier never runs past the claim.
+     */
+    default TrackingOutcome query(String containerNo, long budgetMs) {
+        return query(containerNo);
+    }
 }

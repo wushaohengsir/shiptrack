@@ -4,6 +4,7 @@ import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.format.DateTimeParseException;
@@ -25,7 +26,9 @@ public final class EtaTextParser {
     private static final List<Pattern> DATE_PATTERNS = List.of(
             Pattern.compile("\\b([A-Za-z]{3,9}\\.? \\d{1,2},? \\d{4})\\b"),
             Pattern.compile("\\b(\\d{1,2} [A-Za-z]{3,9}\\.? \\d{4})\\b"),
-            Pattern.compile("\\b(\\d{4}-\\d{2}-\\d{2})\\b"));
+            // Lookarounds rather than \b: an ISO timestamp has "2026-12-06T…"
+            // and both sides of that date are word characters.
+            Pattern.compile("(?<!\\d)(\\d{4}-\\d{2}-\\d{2})(?!\\d)"));
 
     private static final List<DateTimeFormatter> DATE_FORMATS = List.of(
             formatter("MMM d uuuu"),
@@ -34,9 +37,20 @@ public final class EtaTextParser {
             formatter("d MMMM uuuu"),
             formatter("uuuu-MM-dd"));
 
+    /**
+     * A time plus an explicit zone. The offset alternative must come before the
+     * bare abbreviations, otherwise "14:30 UTC+08:00" would match "UTC" and
+     * ignore the "+08:00".
+     */
     private static final Pattern TIME = Pattern.compile(
-            "\\b(\\d{1,2}):(\\d{2})(?:\\s*(UTC|GMT|EST|EDT|PST|PDT|CET|CEST))\\b",
+            "(?<!\\d)(\\d{1,2}):(\\d{2})(?::\\d{2})?\\s*"
+                    + "(Z|(?:UTC|GMT)\\s*[+-]\\s*\\d{1,2}(?::?\\d{2})?"
+                    + "|[+-]\\d{1,2}(?::?\\d{2})?"
+                    + "|UTC|GMT|EST|EDT|PST|PDT|CET|CEST)\\b",
             Pattern.CASE_INSENSITIVE);
+
+    private static final Pattern OFFSET = Pattern.compile(
+            "^(?:(?:UTC|GMT))?([+-])(\\d{1,2})(?::?(\\d{2}))?$");
 
     /**
      * Abbreviations such as {@code PST} are fixed offsets, not region zones:
@@ -82,7 +96,11 @@ public final class EtaTextParser {
     }
 
     /**
-     * Returns a time only together with an explicit, unambiguous zone.
+     * Returns a time only together with an explicit, unambiguous zone. The
+     * returned zone is an IANA id when one exists for the offset (whole-hour
+     * offsets use {@code Etc/GMT±X}); a half-hour offset keeps its ISO offset
+     * id and is downgraded to DATE by the reporter, which must publish an IANA
+     * name (§3.3).
      */
     public static Optional<ZonedTime> parseTime(String text) {
         if (text == null || text.isBlank()) {
@@ -97,11 +115,8 @@ public final class EtaTextParser {
         if (hour > 23 || minute > 59) {
             return Optional.empty();
         }
-        String zone = ZONES.get(matcher.group(3).toUpperCase(Locale.ROOT));
-        if (zone == null) {
-            return Optional.empty();
-        }
-        return Optional.of(new ZonedTime(LocalTime.of(hour, minute), zone));
+        Optional<String> zone = zoneOf(matcher.group(3));
+        return zone.map(value -> new ZonedTime(LocalTime.of(hour, minute), value));
     }
 
     /**
@@ -122,6 +137,51 @@ public final class EtaTextParser {
         } catch (RuntimeException e) {
             return Optional.empty();
         }
+    }
+
+    private static Optional<String> zoneOf(String rawZone) {
+        String token = rawZone.trim().toUpperCase(Locale.ROOT).replaceAll("\\s+", "");
+        if (token.equals("Z")) {
+            return Optional.of("UTC");
+        }
+        String abbreviation = ZONES.get(token);
+        if (abbreviation != null) {
+            return Optional.of(abbreviation);
+        }
+        Matcher offset = OFFSET.matcher(token);
+        if (!offset.matches()) {
+            return Optional.empty();
+        }
+        int sign = "-".equals(offset.group(1)) ? -1 : 1;
+        int hours = Integer.parseInt(offset.group(2));
+        int minutes = offset.group(3) == null ? 0 : Integer.parseInt(offset.group(3));
+        if (hours > 18 || minutes > 59) {
+            return Optional.empty();
+        }
+        int totalSeconds = sign * (hours * 3600 + minutes * 60);
+        try {
+            return Optional.of(ianaFor(ZoneOffset.ofTotalSeconds(totalSeconds)));
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * IANA has fixed-offset names only for whole hours. Half-hour offsets keep
+     * their ISO id here; the reporter then falls back to DATE precision so the
+     * wire contract never carries a non-IANA timezone.
+     */
+    private static String ianaFor(ZoneOffset offset) {
+        int total = offset.getTotalSeconds();
+        if (total % 3600 == 0 && total >= -12 * 3600 && total <= 14 * 3600) {
+            int hours = total / 3600;
+            if (hours == 0) {
+                return "UTC";
+            }
+            // Etc/GMT-8 is UTC+8: the sign in the IANA name is inverted.
+            return hours > 0 ? "Etc/GMT-" + hours : "Etc/GMT+" + (-hours);
+        }
+        return offset.getId();
     }
 
     private static DateTimeFormatter formatter(String pattern) {

@@ -90,13 +90,18 @@ public class CollectorRunner {
                 // §3.2: always claim exactly one task, process and report it,
                 // then claim the next. Claiming a batch and walking away would
                 // hold leases for tasks this cycle never runs.
+                // The lease clock starts before the claim request: the server
+                // writes `claimed_at` later, so this is the conservative bound.
+                long claimStartedAt = System.nanoTime();
                 TrackingTaskClaimResponse claim = api.claimTasks(run.runId(), 1);
                 if (claim == null || claim.items() == null || claim.items().isEmpty()) {
                     sleep(properties.getEmptyClaimBackoffMs());
                     break;
                 }
+                LeaseBudget lease = LeaseBudget.startingAt(claimStartedAt,
+                        properties.getLeaseDurationMs(), properties.getLeaseSafetyMarginMs());
                 ClaimedTaskDto task = claim.items().getFirst();
-                processTask(claim.runId() == null ? run.runId() : claim.runId(), task);
+                processTask(claim.runId() == null ? run.runId() : claim.runId(), task, lease);
                 processed++;
             }
             if (processed >= maxTasks) {
@@ -108,27 +113,51 @@ public class CollectorRunner {
         }
     }
 
-    private void processTask(String runId, ClaimedTaskDto task) {
+    private void processTask(String runId, ClaimedTaskDto task, LeaseBudget lease) {
+        if (lease.expired()) {
+            log.warn("Lease already spent before container_id={}; leaving it for reclaim",
+                    task.containerId());
+            return;
+        }
         // §3.2: check the mount and fix the mapping snapshot before the query.
         // The same snapshot and version are used for the whole task.
         StatusMappingSet mappings = mappingsLoader.refreshAndGet();
 
         int retryCount = 0;
-        TrackingOutcome outcome = trackingClient.query(task.containerNo());
+        TrackingOutcome outcome = trackingClient.query(task.containerNo(), lease.remainingMs());
         while (outcome instanceof TrackingOutcome.Failure failure
                 && failure.retryable()
                 && retryCount < task.maxRetry()) {
-            sleep(properties.getRetryBackoffMs() * (retryCount + 1L));
+            long backoff = properties.getRetryBackoffMs() * (retryCount + 1L);
+            if (!lease.canWait(backoff)) {
+                log.warn("Lease too short for retry backoff (container_id={}, remaining={}ms); "
+                        + "reporting the last outcome", task.containerId(), lease.remainingMs());
+                break;
+            }
+            sleep(backoff);
+            if (lease.expired()) {
+                log.warn("Lease expired during retry backoff for container_id={}; "
+                        + "leaving it for reclaim", task.containerId());
+                return;
+            }
             retryCount++;
             log.info("Retrying container_id={} ({}/{}) after {}",
                     task.containerId(), retryCount, task.maxRetry(), failure.errorCode());
-            outcome = trackingClient.query(task.containerNo());
+            outcome = trackingClient.query(task.containerNo(), lease.remainingMs());
+        }
+
+        if (lease.expired()) {
+            // The server has already reclaimed the row; the token is stale and
+            // must not be used. The normal claim loop will pick the task up.
+            log.warn("Lease expired before reporting container_id={}; leaving it for reclaim",
+                    task.containerId());
+            return;
         }
 
         OffsetDateTime queriedAt = OffsetDateTime.now(ZoneId.of(properties.getQueryZone()));
         TrackingResultReport report = resultFactory.build(runId, task, mappings, outcome, retryCount, queriedAt);
 
-        reportWithRetry(runId, task, report);
+        reportWithRetry(runId, task, report, lease);
     }
 
     /**
@@ -137,12 +166,18 @@ public class CollectorRunner {
      * {@code queried_at} and {@code retry_count}, within the lease.
      * 409/4xx are terminal: another writer owns the row or the request is invalid.
      */
-    private void reportWithRetry(String runId, ClaimedTaskDto task, TrackingResultReport report) {
+    private void reportWithRetry(String runId, ClaimedTaskDto task, TrackingResultReport report,
+                                 LeaseBudget lease) {
         int maxAttempts = Math.max(1, properties.getReportMaxAttempts());
         long backoff = Math.max(0, properties.getReportBackoffMs());
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            if (lease.expired()) {
+                log.warn("Lease expired before report attempt {} for container_id={}; "
+                        + "task will be reclaimed", attempt, task.containerId());
+                return;
+            }
             try {
-                api.report(report);
+                api.report(report, lease.timeoutMs(properties.getReadTimeoutMs()));
                 log.info("Reported run_id={} container_id={} success={} retry={}",
                         runId, task.containerId(), report.success(), report.retryCount());
                 return;
@@ -166,7 +201,13 @@ public class CollectorRunner {
                 log.warn("Transient report failure run_id={} container_id={} ({}), retrying {}/{}",
                         runId, task.containerId(), firstLine(e.getMessage()), attempt, maxAttempts);
             }
-            sleep(backoff * attempt);
+            long wait = backoff * attempt;
+            if (!lease.canWait(wait)) {
+                log.warn("Lease too short for report retry backoff (container_id={}, remaining={}ms); "
+                        + "task will be reclaimed", task.containerId(), lease.remainingMs());
+                return;
+            }
+            sleep(wait);
         }
     }
 

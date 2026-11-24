@@ -1,6 +1,5 @@
 package com.shiptrack.collector.msc;
 
-import com.shiptrack.contract.enums.EventTimeType;
 import com.shiptrack.contract.enums.TrackedMilestone;
 import org.springframework.stereotype.Component;
 
@@ -42,13 +41,22 @@ public final class MscResultParser {
     private static final Pattern LOCATION =
             Pattern.compile("(?im)^\\s*(?:current\\s+location|last\\s+known\\s+location|location)\\s*[:\\-]\\s*(.+)$");
 
+    /**
+     * Only explicit forecast wording marks a value as an ETA. "Actual arrival
+     * at Vancouver" is a fact, not an estimate, and must not be published as
+     * the POD ETA.
+     */
     private static final Pattern ETA_HINT = Pattern.compile(
-            "(?i)(\\beta\\b|estimated\\s+(?:time\\s+of\\s+)?arrival|arrival\\s+at|expected\\s+arrival)");
+            "(?i)\\b(eta|estimated|expected|planned|scheduled)\\b");
+
+    private static final Pattern CONTAINER_TOKEN = Pattern.compile(
+            "(?i)\\b([A-Z]{4}\\d{7})\\b");
 
     private static final int MAX_RAW_VALUE = 200;
 
     public ParsedTracking parse(MscPageSnapshot snapshot, String containerNo) {
         String body = snapshot.bodyText() == null ? "" : snapshot.bodyText();
+        requireSameContainer(body, snapshot.eventLines(), containerNo);
 
         String rawStatus = firstNonBlank(snapshot.statusText(), match(STATUS_LINE, body));
         if (rawStatus == null) {
@@ -68,7 +76,7 @@ public final class MscResultParser {
             Optional<EtaTextParser.ZonedTime> time = EtaTextParser.parseTime(trimmed);
             events.add(new RawEvent(
                     trimmed,
-                    eventTimeType(trimmed),
+                    StatusWording.eventTimeType(trimmed),
                     EtaTextParser.parseDateTime(trimmed).orElse(null),
                     time.map(EtaTextParser.ZonedTime::timezone).orElse(null)));
         }
@@ -136,19 +144,20 @@ public final class MscResultParser {
                 || lower.contains("via ")) {
             return Optional.empty();
         }
-        if (lower.contains("final destination")) {
-            return Optional.of(TrackedMilestone.FINAL_DESTINATION);
-        }
+        boolean namesFinal = lower.contains("final destination");
+        boolean namesPod = lower.contains("port of discharge") || lower.contains("discharge port")
+                || lower.matches(".*\\bpod\\b.*");
         boolean mentionsPod = containsPlace(lower, pod);
         boolean mentionsFinal = containsPlace(lower, finalDestination);
-        if (mentionsFinal && !mentionsPod) {
+        // One line naming both nodes cannot be split reliably: the date may
+        // belong to either, so it is dropped instead of guessed as the POD.
+        if ((namesPod || mentionsPod) && (namesFinal || mentionsFinal)) {
+            return Optional.empty();
+        }
+        if (namesFinal || mentionsFinal) {
             return Optional.of(TrackedMilestone.FINAL_DESTINATION);
         }
-        if (mentionsPod) {
-            return Optional.of(TrackedMilestone.POD_ARRIVAL);
-        }
-        if (lower.contains("port of discharge") || lower.contains("discharge port")
-                || lower.matches(".*\\bpod\\b.*") || lower.contains("arrival at pod")) {
+        if (namesPod || mentionsPod) {
             return Optional.of(TrackedMilestone.POD_ARRIVAL);
         }
         return Optional.empty();
@@ -159,33 +168,52 @@ public final class MscResultParser {
             return false;
         }
         String city = place.split(",")[0].trim().toLowerCase(Locale.ROOT);
-        return city.length() > 2 && haystack.contains(city);
+        if (city.length() <= 2) {
+            return false;
+        }
+        // Whole-word match: "Vancouver" must not match inside another token.
+        return Pattern.compile("(?<![\\p{L}\\d])" + Pattern.quote(city) + "(?![\\p{L}\\d])")
+                .matcher(haystack)
+                .find();
+    }
+
+    /**
+     * Refuses a result block that belongs to another container. When the page
+     * prints no ISO 6346 token at all there is nothing to compare, and the
+     * status selector remains the only signal.
+     */
+    private static void requireSameContainer(String body, List<String> eventLines, String containerNo) {
+        String expected = normalizeContainer(containerNo);
+        if (expected.isEmpty()) {
+            return;
+        }
+        StringBuilder haystack = new StringBuilder(body);
+        for (String line : eventLines) {
+            if (line != null) {
+                haystack.append('\n').append(line);
+            }
+        }
+        Matcher matcher = CONTAINER_TOKEN.matcher(haystack);
+        boolean sawToken = false;
+        while (matcher.find()) {
+            sawToken = true;
+            if (normalizeContainer(matcher.group(1)).equals(expected)) {
+                return;
+            }
+        }
+        if (sawToken) {
+            throw new MscParseException("result page is for another container, not " + expected);
+        }
+    }
+
+    private static String normalizeContainer(String value) {
+        return value == null ? "" : value.toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9]", "");
     }
 
     private static boolean sameEta(RawEta left, RawEta right) {
         return left.date().equals(right.date())
                 && java.util.Objects.equals(left.time(), right.time())
                 && java.util.Objects.equals(left.timezone(), right.timezone());
-    }
-
-    private static EventTimeType eventTimeType(String line) {
-        String lower = line.toLowerCase(Locale.ROOT);
-        if (lower.contains("cancel") || lower.contains("void")) {
-            return EventTimeType.CANCELLED;
-        }
-        if (lower.contains("estimated") || lower.contains("expected")
-                || lower.contains("planned") || lower.contains("scheduled")
-                || lower.matches(".*\\beta\\b.*")) {
-            return EventTimeType.PLANNED;
-        }
-        if (lower.contains("actual") || lower.contains("gate in") || lower.contains("loaded")
-                || lower.contains("departed") || lower.contains("discharged")
-                || lower.contains("arrived") || lower.contains("available")
-                || lower.contains("picked up") || lower.contains("returned")
-                || lower.contains("released") || lower.contains("transshipment")) {
-            return EventTimeType.ACTUAL;
-        }
-        return null;
     }
 
     private static String match(Pattern pattern, String body) {

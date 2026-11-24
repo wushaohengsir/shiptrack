@@ -9,11 +9,15 @@
 # contains "Container picked up", so the empty-container rule must rank higher
 # or a returned empty box would be reported as the loaded box being picked up.
 #
+# v2 re-ranked the empty-container rules (AC-36). The version had to be bumped:
+# the collector rejects changed rules under an already published version, so a
+# live mount that is replaced in place only hot-switches when the number rises.
+#
 # The MSC phrases below are the first cut for the M2 probe. They must be
 # confirmed against the live page during the §13.1 validation; until then this
 # list only covers wording the requirements already quote.
-version: 1
-updated_at: "2026-11-24T21:00:00+08:00"
+version: 2
+updated_at: "2026-11-24T22:10:00+08:00"
 mappings:
   - carrier: MSC
     match: "Empty container released"

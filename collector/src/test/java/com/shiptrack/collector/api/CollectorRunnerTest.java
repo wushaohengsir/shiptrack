@@ -89,7 +89,97 @@ class CollectorRunnerTest {
         assertThat(api.reports).hasSize(1);
     }
 
+    @Test
+    void stopsRetryingAReportWhenTheBackoffWouldOutliveTheLease() throws IOException {
+        FakeApi api = new FakeApi(task(10L, "MSDU7172233", "clm_1"));
+        api.failReportsWith(httpError(503, "unavailable"), 5);
+
+        runner(api, 1, containerNo -> success(), properties -> {
+            properties.setLeaseDurationMs(500);
+            properties.setLeaseSafetyMarginMs(0);
+            properties.setReportBackoffMs(10_000);
+        }).poll();
+
+        // One attempt with the original token, then the lease is too short to
+        // wait: the task is left for the server's reclaim instead of using a
+        // stale token.
+        assertThat(api.reports).hasSize(1);
+        assertThat(api.reportTimeouts).singleElement()
+                .satisfies(timeout -> assertThat(timeout).isBetween(1L, 600L));
+    }
+
+    @Test
+    void stopsQueryRetriesWhenTheBackoffWouldOutliveTheLease() throws IOException {
+        FakeApi api = new FakeApi(task(10L, "MSDU7172233", "clm_1"));
+        java.util.concurrent.atomic.AtomicInteger queries = new java.util.concurrent.atomic.AtomicInteger();
+
+        runner(api, 1, containerNo -> {
+            queries.incrementAndGet();
+            return new TrackingOutcome.Failure(com.shiptrack.contract.internal.AgentErrorCode.TIMEOUT,
+                    "slow carrier");
+        }, properties -> {
+            properties.setLeaseDurationMs(120);
+            properties.setLeaseSafetyMarginMs(0);
+            properties.setRetryBackoffMs(10_000);
+        }).poll();
+
+        assertThat(queries).hasValue(1);
+        assertThat(api.reports).hasSize(1);
+        assertThat(api.reports.getFirst().retryCount()).isZero();
+    }
+
+    @Test
+    void doesNotReportWhenTheLeaseExpiresDuringTheQuery() throws IOException {
+        FakeApi api = new FakeApi(task(10L, "MSDU7172233", "clm_1"));
+
+        runner(api, 1, containerNo -> {
+            sleep(250);
+            return success();
+        }, properties -> {
+            properties.setLeaseDurationMs(100);
+            properties.setLeaseSafetyMarginMs(0);
+        }).poll();
+
+        // The token is already stale on the server side; no query result is
+        // written and the normal claim path will hand the task out again.
+        assertThat(api.reports).isEmpty();
+    }
+
+    @Test
+    void doesNotQueryAtAllWhenTheLeaseIsAlreadyGone() throws IOException {
+        FakeApi api = new FakeApi(task(10L, "MSDU7172233", "clm_1"));
+        java.util.concurrent.atomic.AtomicInteger queries = new java.util.concurrent.atomic.AtomicInteger();
+
+        runner(api, 1, containerNo -> {
+            queries.incrementAndGet();
+            return success();
+        }, properties -> {
+            properties.setLeaseDurationMs(0);
+            properties.setLeaseSafetyMarginMs(0);
+        }).poll();
+
+        assertThat(queries).hasValue(0);
+        assertThat(api.reports).isEmpty();
+    }
+
+    private static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        }
+    }
+
     private CollectorRunner runner(CollectorApi api, int maxTasks, com.shiptrack.collector.msc.MscTrackingClient client)
+            throws IOException {
+        return runner(api, maxTasks, client, properties -> {
+        });
+    }
+
+    private CollectorRunner runner(CollectorApi api, int maxTasks,
+                                   com.shiptrack.collector.msc.MscTrackingClient client,
+                                   java.util.function.Consumer<CollectorProperties> customizer)
             throws IOException {
         Path mapping = tempDir.resolve("status-mappings.yaml");
         Files.writeString(mapping, """
@@ -111,6 +201,7 @@ class CollectorRunnerTest {
         properties.setEmptyClaimBackoffMs(0);
         properties.setReportMaxAttempts(3);
         properties.setReportBackoffMs(0);
+        customizer.accept(properties);
 
         return new CollectorRunner(properties, api, client, loader, new TrackingResultFactory());
     }
@@ -137,6 +228,7 @@ class CollectorRunnerTest {
         private final Deque<ClaimedTaskDto> tasks;
         private final List<Integer> claimLimits = new ArrayList<>();
         private final List<TrackingResultReport> reports = new ArrayList<>();
+        private final List<Long> reportTimeouts = new ArrayList<>();
         private RuntimeException reportFailure;
         private int failureBudget;
 
@@ -175,6 +267,12 @@ class CollectorRunnerTest {
                 throw reportFailure;
             }
             return new TrackingResultResponse(1L, AttemptStatus.SUCCESS, List.of(), null);
+        }
+
+        @Override
+        public TrackingResultResponse report(TrackingResultReport report, long timeoutMs) {
+            reportTimeouts.add(timeoutMs);
+            return report(report);
         }
     }
 }

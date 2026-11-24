@@ -19,4 +19,12 @@ public interface CollectorApi {
     TrackingTaskClaimResponse claimTasks(String runId, int limit);
 
     TrackingResultResponse report(TrackingResultReport report);
+
+    /**
+     * Reports with an upper bound derived from the remaining lease. The default
+     * keeps test doubles simple; the HTTP client caps its own timeouts too.
+     */
+    default TrackingResultResponse report(TrackingResultReport report, long timeoutMs) {
+        return report(report);
+    }
 }

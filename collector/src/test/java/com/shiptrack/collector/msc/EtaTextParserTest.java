@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -60,5 +61,42 @@ class EtaTextParserTest {
     void aDateWithoutTimeOrZoneStaysDateOnly() {
         assertThat(EtaTextParser.parseDateTime("Estimated arrival: Dec 06, 2026")).isEmpty();
         assertThat(EtaTextParser.parseDateTime("Dec 06, 2026 14:30")).isEmpty();
+    }
+
+    @Test
+    void appliesAnExplicitUtcOffsetInsteadOfDroppingIt() {
+        OffsetDateTime plus8 = EtaTextParser.parseDateTime("2026-12-06 14:30 UTC+08:00").orElseThrow();
+        assertThat(plus8.toInstant()).isEqualTo(Instant.parse("2026-12-06T06:30:00Z"));
+        assertThat(plus8.getOffset()).isEqualTo(ZoneOffset.ofHours(8));
+        assertThat(EtaTextParser.parseTime("2026-12-06 14:30 UTC+08:00").orElseThrow().timezone())
+                .isEqualTo("Etc/GMT-8");
+
+        OffsetDateTime minus5 = EtaTextParser.parseDateTime("2026-12-06 09:30 -05:00").orElseThrow();
+        assertThat(minus5.toInstant()).isEqualTo(Instant.parse("2026-12-06T14:30:00Z"));
+        assertThat(EtaTextParser.parseTime("2026-12-06 09:30 -05:00").orElseThrow().timezone())
+                .isEqualTo("Etc/GMT+5");
+    }
+
+    @Test
+    void parsesIsoTimestampsWithAZone() {
+        OffsetDateTime iso = EtaTextParser.parseDateTime("2026-12-06T14:30:00+08:00").orElseThrow();
+        assertThat(iso.toInstant()).isEqualTo(Instant.parse("2026-12-06T06:30:00Z"));
+        assertThat(EtaTextParser.parseTime("2026-12-06T14:30:00+08:00").orElseThrow().timezone())
+                .isEqualTo("Etc/GMT-8");
+
+        OffsetDateTime zulu = EtaTextParser.parseDateTime("2026-12-06T14:30:00Z").orElseThrow();
+        assertThat(zulu.toInstant()).isEqualTo(Instant.parse("2026-12-06T14:30:00Z"));
+        assertThat(EtaTextParser.parseTime("2026-12-06T14:30:00Z").orElseThrow().timezone())
+                .isEqualTo("UTC");
+    }
+
+    @Test
+    void keepsAHalfHourOffsetAccurateEvenThoughItCannotBeNamedInIanaForm() {
+        OffsetDateTime offset = EtaTextParser.parseDateTime("2026-12-06 14:30 UTC+05:30").orElseThrow();
+        assertThat(offset.toInstant()).isEqualTo(Instant.parse("2026-12-06T09:00:00Z"));
+        // The reporter later downgrades this to DATE precision because §3.3
+        // only allows IANA names, but the offset itself must be right.
+        assertThat(EtaTextParser.parseTime("2026-12-06 14:30 UTC+05:30").orElseThrow().timezone())
+                .isEqualTo("+05:30");
     }
 }
