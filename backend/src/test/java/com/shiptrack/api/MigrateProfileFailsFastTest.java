@@ -3,6 +3,7 @@ package com.shiptrack.api;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.context.ConfigurableApplicationContext;
 
 import java.util.Locale;
 import java.util.Map;
@@ -19,6 +20,10 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
  * <p>Command-line arguments are used for the override cases because they sit above
  * YAML, {@code SPRING_DATASOURCE_*} and {@code -Dspring.datasource.*} in precedence
  * order — the strongest form of the bypass reported as R-B3-2.
+ *
+ * <p>Overrides of {@code spring.datasource.hikari.*} and {@code spring.flyway.*} are
+ * covered as well: they can redirect the account or database that really runs the
+ * migration (R-B3-3).
  */
 class MigrateProfileFailsFastTest {
 
@@ -35,6 +40,21 @@ class MigrateProfileFailsFastTest {
     private static final String OVERRIDDEN_PASSWORD_MESSAGE =
             "migrate profile requires spring.datasource.password to come from DB_MIGRATION_PASSWORD;"
                     + " overriding it with another value is not allowed";
+    private static final String OVERRIDDEN_HIKARI_USER_MESSAGE =
+            "migrate profile requires spring.datasource.hikari.username to come from DB_MIGRATION_USER;"
+                    + " overriding it with another value is not allowed";
+    private static final String OVERRIDDEN_FLYWAY_USER_MESSAGE =
+            "migrate profile requires spring.flyway.user to come from DB_MIGRATION_USER;"
+                    + " overriding it with another value is not allowed";
+    private static final String OVERRIDDEN_FLYWAY_PASSWORD_MESSAGE =
+            "migrate profile requires spring.flyway.password to come from DB_MIGRATION_PASSWORD;"
+                    + " overriding it with another value is not allowed";
+    private static final String OVERRIDDEN_HIKARI_URL_MESSAGE =
+            "migrate profile requires spring.datasource.hikari.jdbc-url to match spring.datasource.url;"
+                    + " pointing the migration at another database is not allowed";
+    private static final String OVERRIDDEN_FLYWAY_URL_MESSAGE =
+            "migrate profile requires spring.flyway.url to match spring.datasource.url;"
+                    + " pointing the migration at another database is not allowed";
 
     @Test
     void missingMigrationUserAbortsStartup() {
@@ -84,6 +104,77 @@ class MigrateProfileFailsFastTest {
                 OVERRIDDEN_PASSWORD_MESSAGE,
                 "--spring.datasource.username=" + MIGRATION_USER,
                 "--spring.datasource.password=override_runtime");
+    }
+
+    @Test
+    void overriddenHikariUsernameIsRejected() {
+        // Hikari applies spring.datasource.hikari.* after the standard properties, so
+        // this is a real account swap even when spring.datasource.username is correct.
+        assertGuardRejects(
+                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
+                OVERRIDDEN_HIKARI_USER_MESSAGE,
+                "--spring.datasource.hikari.username=override_runtime");
+    }
+
+    @Test
+    void overriddenHikariUrlIsRejected() {
+        assertGuardRejects(
+                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
+                OVERRIDDEN_HIKARI_URL_MESSAGE,
+                "--spring.datasource.hikari.jdbc-url=jdbc:mysql://override.example:3306/shiptrack");
+    }
+
+    @Test
+    void overriddenFlywayUserIsRejected() {
+        // spring.flyway.user makes Flyway build its own DataSource, bypassing the
+        // guarded Hikari connection (R-B3-3).
+        assertGuardRejects(
+                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
+                OVERRIDDEN_FLYWAY_USER_MESSAGE,
+                "--spring.flyway.user=shiptrack_runtime");
+    }
+
+    @Test
+    void overriddenFlywayPasswordIsRejected() {
+        assertGuardRejects(
+                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
+                OVERRIDDEN_FLYWAY_PASSWORD_MESSAGE,
+                "--spring.flyway.password=runtime-decoy");
+    }
+
+    @Test
+    void overriddenFlywayUrlIsRejected() {
+        assertGuardRejects(
+                Map.of("DB_MIGRATION_USER", MIGRATION_USER, "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD),
+                OVERRIDDEN_FLYWAY_URL_MESSAGE,
+                "--spring.flyway.url=jdbc:mysql://override.example:3306/shiptrack");
+    }
+
+    @Test
+    void missingMigrationUserAbortsEvenWhenFlywayIsOverridden() {
+        assertGuardRejects(
+                Map.of("DB_MIGRATION_PASSWORD", "secret"),
+                MISSING_USER_MESSAGE,
+                "--spring.flyway.user=override_runtime",
+                "--spring.flyway.password=override_runtime");
+    }
+
+    @Test
+    void matchingFlywayOverridesAreAllowed() {
+        // Explicit but identical values are not a bypass; the guard only rejects a
+        // different account or target. Flyway is disabled so the context starts
+        // without a database call.
+        try (ConfigurableApplicationContext context = new SpringApplicationBuilder(ApiApplication.class)
+                .profiles("migrate")
+                .web(WebApplicationType.NONE)
+                .properties(Map.of(
+                        "DB_MIGRATION_USER", MIGRATION_USER,
+                        "DB_MIGRATION_PASSWORD", MIGRATION_PASSWORD))
+                .run("--spring.flyway.enabled=false",
+                        "--spring.flyway.user=" + MIGRATION_USER,
+                        "--spring.flyway.password=" + MIGRATION_PASSWORD)) {
+            assertNotNull(context.getId());
+        }
     }
 
     private static void assertGuardRejects(

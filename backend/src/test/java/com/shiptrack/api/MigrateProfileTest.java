@@ -95,7 +95,12 @@ class MigrateProfileTest {
         assertEquals(MIGRATION_USER, environment.getProperty("spring.datasource.username"));
         assertNotEquals(RUNTIME_USER_DECOY, environment.getProperty("spring.datasource.username"));
 
-        try (Connection connection = dataSource.getConnection();
+        // Flyway may hold its own DataSource; assert against the connection it actually
+        // uses, so an independent spring.flyway.* override cannot slip through (R-B3-3).
+        DataSource flywayDataSource = flyway.getConfiguration().getDataSource();
+        assertNotNull(flywayDataSource, "Flyway must run against a concrete DataSource");
+
+        try (Connection connection = flywayDataSource.getConnection();
              Statement statement = connection.createStatement();
              ResultSet rows = statement.executeQuery("SELECT CURRENT_USER()")) {
             assertTrue(rows.next());
