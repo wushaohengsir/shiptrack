@@ -13,6 +13,18 @@ set -euo pipefail
 : "${DB_APP_USER:?DB_APP_USER is required}"
 : "${DB_APP_PASSWORD:?DB_APP_PASSWORD is required}"
 
+# Two separate accounts are what keeps DDL away from the API at runtime. With a
+# shared user the second CREATE USER IF NOT EXISTS is a no-op and the DML grant
+# leaves the DDL privileges in place, so refuse before touching the database.
+if [[ "$DB_MIGRATION_USER" == "$DB_APP_USER" ]]; then
+    echo "mysql-init: DB_MIGRATION_USER and DB_APP_USER must be different accounts" >&2
+    exit 1
+fi
+if [[ "$DB_MIGRATION_PASSWORD" == "$DB_APP_PASSWORD" ]]; then
+    echo "mysql-init: DB_MIGRATION_PASSWORD and DB_APP_PASSWORD must be different" >&2
+    exit 1
+fi
+
 # Identifiers are interpolated into SQL, so only accept a safe alphabet.
 for identifier in "$MYSQL_DATABASE" "$DB_MIGRATION_USER" "$DB_APP_USER"; do
     if [[ ! "$identifier" =~ ^[A-Za-z0-9_]+$ ]]; then
@@ -20,6 +32,11 @@ for identifier in "$MYSQL_DATABASE" "$DB_MIGRATION_USER" "$DB_APP_USER"; do
         exit 1
     fi
 done
+
+# In a database-level GRANT, `_` remains a wildcard even inside backticks, so
+# `ship_track` would also match `shipXtrack`. Escape it to keep the grant on
+# this one schema. (`%` cannot appear: the identifier check above rejects it.)
+GRANT_DB=${MYSQL_DATABASE//_/\\_}
 
 # MySQL string literal: backslash is an escape character, single quotes double up.
 sql_escape() {
@@ -34,10 +51,10 @@ CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'%'
     IDENTIFIED BY '$(sql_escape "$DB_APP_PASSWORD")';
 
 GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES
-    ON \`${MYSQL_DATABASE}\`.* TO '${DB_MIGRATION_USER}'@'%';
+    ON \`${GRANT_DB}\`.* TO '${DB_MIGRATION_USER}'@'%';
 
 GRANT SELECT, INSERT, UPDATE, DELETE
-    ON \`${MYSQL_DATABASE}\`.* TO '${DB_APP_USER}'@'%';
+    ON \`${GRANT_DB}\`.* TO '${DB_APP_USER}'@'%';
 
 FLUSH PRIVILEGES;
 SQL

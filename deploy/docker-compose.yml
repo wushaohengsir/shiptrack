@@ -2,12 +2,10 @@
 #
 #   cd deploy
 #   cp .env.example .env        # then fill every change-me value
-#   docker compose up -d mysql
-#   docker compose --profile migrate run --rm migrate
-#   docker compose up -d app
+#   docker compose up -d        # mysql -> one-shot migrate -> app
 #
 # Every secret is read from deploy/.env (git-ignored); nothing is baked into
-# an image and the database port is published on 127.0.0.1 only.
+# an image. Neither the database nor the API is published beyond loopback.
 
 name: shiptrack
 
@@ -32,20 +30,22 @@ services:
     volumes:
       - mysql-data:/var/lib/mysql
       - ./mysql-init:/docker-entrypoint-initdb.d:ro
-    ports:
-      # Loopback only: the database must never be reachable from the internet.
-      - "127.0.0.1:${MYSQL_HOST_PORT:-3306}:3306"
+    # No host port: the database is reachable only on the compose network.
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      # Authenticated query, not mysqladmin ping: ping exits 0 even when the
+      # root password is rejected, which would hide a failed bootstrap. The
+      # socket is used because root is localhost-only and is not granted TCP.
+      test: ["CMD-SHELL", "mysql --protocol=socket -uroot -p\"$$MYSQL_ROOT_PASSWORD\" -e 'SELECT 1' >/dev/null 2>&1"]
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 30s
 
   # One-shot Flyway migration. Uses the DDL account and exits; the API never
-  # migrates and never holds DDL credentials.
+  # migrates and never holds DDL credentials. Not behind a profile: `app`
+  # depends on this service completing successfully, so every `up` migrates
+  # first and a failed migration keeps the new API from starting.
   migrate:
-    profiles: ["migrate"]
     build:
       context: ..
       dockerfile: Dockerfile
@@ -78,6 +78,8 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       DB_URL: "jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-shiptrack}?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC&useSSL=false&allowPublicKeyRetrieval=true"
       DB_USER: ${DB_APP_USER:-shiptrack_app}
@@ -85,7 +87,8 @@ services:
       JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:--Xms256m -Xmx512m}
       TZ: ${TZ:-Asia/Shanghai}
     ports:
-      - "${APP_HOST_PORT:-8080}:8080"
+      # Loopback only. Public traffic must go through the HTTPS reverse proxy.
+      - "127.0.0.1:${APP_HOST_PORT:-8080}:8080"
     read_only: true
     tmpfs:
       - /tmp

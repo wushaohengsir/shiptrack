@@ -1,7 +1,8 @@
 # 腾讯云初版部署（Docker Compose）
 
-单机部署两个容器：`shiptrack-api`（Spring Boot API）与 `mysql:8.4`。
-迁移是独立的一次性容器（`--profile migrate`），API 运行时只拿 DML 账号。
+单机部署两个常驻容器：`shiptrack-api`（Spring Boot API）与 `mysql:8.4`，
+外加一个一次性迁移容器。`docker compose up` 先执行迁移，迁移成功退出后
+API 才会启动；迁移失败时新版本 API 不会拉起。API 运行时只拿 DML 账号。
 
 > 当前处于 M1 阶段：API 已能启动、连接数据库，但还没有对外 HTTP 接口。
 > 验证方式以容器状态和启动日志为准。
@@ -17,20 +18,26 @@
 sudo usermod -aG docker deploy
 ```
 
+> `docker` 组成员等同宿主机 root 权限，只授予部署账号，不要给普通账号加。
+
 ## 2. 腾讯云安全组
 
 | 方向 | 端口 | 来源 | 说明 |
 | --- | --- | --- | --- |
 | 入站 | 22 | 管理与 CI 出口 IP | 不要对 `0.0.0.0/0` 开放 |
-| 入站 | 8080（或前置 Nginx 的 80/443） | 业务需要访问的来源 | 暂时无接口，可先不开 |
-| 入站 | 3306 | **禁止开放** | 数据库只监听宿主机 `127.0.0.1` |
+| 入站 | 80/443 | 前置 HTTPS 反代 | 初版无对外接口，暂不开放 |
+| 入站 | 8080 | **禁止开放** | API 只绑宿主机 `127.0.0.1`，公网走反代 |
+| 入站 | 3306 | **禁止开放** | MySQL 不发布任何宿主端口 |
 | 出站 | 443 | 任意 | Maven 构建、MSC 采集、飞书 OpenAPI |
 
 ## 3. 首次部署
 
 ```bash
 git clone https://github.com/wushaohengsir/shiptrack.git
-cd shiptrack/deploy
+cd shiptrack
+# 首发固定到复审通过的提交，不要直接跟随 main 的最新推送。
+git checkout <复审通过的提交 SHA>
+cd deploy
 
 cp .env.example .env
 chmod 600 .env
@@ -41,16 +48,15 @@ chmod 600 .env
 docker compose up -d mysql
 docker compose ps          # 等到 mysql 显示 healthy
 
-# 3.2 执行一次性迁移（Flyway，DDL 账号，跑完即退出）
-docker compose --profile migrate run --rm migrate
-
-# 3.3 启动 API（DML 账号）
-docker compose up -d app
+# 3.2 启动迁移与 API（migrate 成功退出后 app 才会启动）
+docker compose up -d
 docker compose ps
+docker compose logs --tail=50 migrate
 docker compose logs --tail=50 app
 ```
 
-日志里出现 `Started ApiApplication` 即启动成功。
+`migrate` 退出码非 0 时，`app` 不会被创建或启动，`docker compose ps` 里看不到 `app`。
+迁移日志出现 `Successfully applied`、应用日志出现 `Started ApiApplication` 即成功。
 
 ## 4. 验证
 
@@ -64,16 +70,21 @@ docker compose exec -T mysql sh -c \
   'MYSQL_PWD="$DB_MIGRATION_PASSWORD" mysql -u"$DB_MIGRATION_USER" -e "SELECT version, success FROM flyway_schema_history" "$MYSQL_DATABASE"'
 ```
 
-容器内部相互访问走 compose 网络（`mysql:3306`），宿主机上只有 `127.0.0.1:3306`。
+容器内部相互访问走 compose 网络（`mysql:3306`）。宿主机上不应出现 3306，
+只应有 API 的回环端口：
+
+```bash
+ss -ltnp | grep -E ':8080|:3306'
+# 期望仅看到 127.0.0.1:8080；出现 3306 或 0.0.0.0:8080 说明配置被改动
+```
 
 ## 5. 升级
 
 ```bash
 cd shiptrack && git pull
 cd deploy
-docker compose build app
-docker compose --profile migrate run --rm migrate   # 有新迁移时
-docker compose up -d app
+docker compose build
+docker compose up -d    # 先跑 migrate，成功后才切换 app
 ```
 
 镜像标签默认为 `local`；需要保留版本时在 `.env` 里设置 `APP_IMAGE_TAG=<版本>`，
@@ -94,7 +105,8 @@ docker compose exec -T mysql sh -c \
 
 - 真实密码只存在于 `deploy/.env`（`chmod 600`、git 已忽略），不进镜像、不进仓库、不进 CI 日志。
 - 迁移账号与业务账号分离；API 不启用 Flyway，也没有 DDL 权限。
-- MySQL 端口只发布到 `127.0.0.1`；`MYSQL_ROOT_HOST=localhost`，root 只能走容器内 socket。
+- MySQL 不发布任何宿主端口；`MYSQL_ROOT_HOST=localhost`，root 只能走容器内 socket。
+- API 只绑 `127.0.0.1`，公网访问必须经过前置 HTTPS 反代。
 - 应用容器 `read_only` + `cap_drop: ALL` + `no-new-privileges`，仅 `/tmp` 可写。
 - 后续接 GitHub Actions CD 时，SSH 私钥与主机信息放 Repo Secrets，不写进 workflow 文件。
 
@@ -109,10 +121,12 @@ M2 落地时新增 `deploy/Dockerfile.collector` 与独立的 compose 服务。
 | 现象 | 排查 |
 | --- | --- |
 | `mysql` 一直 `starting` | `docker compose logs mysql`；首次初始化要建库建账号，属正常耗时 |
+| 初始化日志出现 `must be different` | `DB_MIGRATION_*` 与 `DB_APP_*` 是同一个用户名或同一个密码；改成两套不同凭据后，空卷重试 |
 | 迁移报 `access denied` | `.env` 的 `DB_MIGRATION_*` 与首次初始化时的值不一致；改过密码需重建卷或手动 `ALTER USER` |
-| 迁移报 `requires spring.datasource.url` | compose 未传 `DB_URL`，检查 `docker compose config` |
+| 迁移报 `requires spring.datasource.url` | compose 未传 `DB_URL`，用 `docker compose config -q` 校验配置（不要直接输出 `config`，会打印明文口令） |
 | `app` 反复重启 | `docker compose logs app`；常见原因是 `DB_URL`/`DB_APP_*` 拼写错误 |
 | 改了 `.env` 但没生效 | `docker compose up -d` 需要重建容器：`docker compose up -d --force-recreate app` |
 
-> 注意：`mysql-init` 脚本只在数据卷为空时执行一次。`docker compose down -v`
-> 会删除全部数据，仅在确认不需要数据时使用。
+> 注意：`mysql-init` 脚本只在数据卷为空时执行一次。初始化校验失败时数据卷
+> 已不再为空，修正 `.env` 后需 `docker compose down -v` 才能让脚本重跑；
+> 该命令会删除全部数据，仅在新机首启或确认无需保留数据时使用。
