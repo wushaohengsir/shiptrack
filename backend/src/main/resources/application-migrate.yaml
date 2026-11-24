@@ -1,11 +1,13 @@
 # One-shot migration profile: run once with --spring.profiles.active=migrate,
-# using the DDL-capable migration account, then exit. The API never migrates.
+# using the dedicated DDL-capable migration account, then exit. The API never migrates.
+# No fallback to DB_USER/DB_PASSWORD on purpose: migrations must never silently run
+# on the API runtime account (技术栈使用说明 §3.7). Missing credentials abort startup.
 spring:
   main:
     web-application-type: none
   datasource:
-    username: ${DB_MIGRATION_USER:${DB_USER:shiptrack}}
-    password: ${DB_MIGRATION_PASSWORD:${DB_PASSWORD:}}
+    username: ${DB_MIGRATION_USER}
+    password: ${DB_MIGRATION_PASSWORD}
   flyway:
     enabled: true
 
