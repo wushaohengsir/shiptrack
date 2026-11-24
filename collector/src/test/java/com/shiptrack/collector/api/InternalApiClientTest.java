@@ -35,6 +35,8 @@ class InternalApiClientTest {
     private final AtomicReference<String> reportBody = new AtomicReference<>();
     private volatile boolean dripReport;
     private volatile long dripDelayMs;
+    private final java.util.concurrent.atomic.AtomicBoolean dripAborted =
+            new java.util.concurrent.atomic.AtomicBoolean();
 
     private InternalApiClient client;
 
@@ -153,6 +155,26 @@ class InternalApiClientTest {
         assertThat(elapsedMs).isLessThan(650L);
     }
 
+    @Test
+    void physicallyStopsTheDrippingResponseWhenTheBudgetExpires() throws Exception {
+        dripReport = true;
+        dripDelayMs = 200;
+
+        assertThatThrownBy(() -> client.report(sampleReport(), 300))
+                .isInstanceOf(org.springframework.web.client.RestClientException.class)
+                .hasMessageContaining("did not finish");
+
+        // The server keeps writing after the client's budget ended. It must see
+        // the connection break instead of writing for the whole body.
+        long deadline = System.nanoTime() + 2_000_000_000L;
+        while (!dripAborted.get() && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(dripAborted)
+                .as("the client must close the socket, not leave the server writing")
+                .isTrue();
+    }
+
     private static TrackingResultReport sampleReport() {
         return new TrackingResultReport(
                 "run_1", 10L, "MSDU7172233", "MSC", "clm_1", 0, 7,
@@ -165,7 +187,7 @@ class InternalApiClientTest {
     }
 
     /** Sends the body in chunks to prove a per-read timeout cannot bound the total. */
-    private static void drip(HttpExchange exchange, long delayMs) throws IOException {
+    private void drip(HttpExchange exchange, long delayMs) throws IOException {
         String body = """
                 {"snapshot_id":5003,"attempt_status":"success","events":[],
                  "order_notification":{"state":"not_applicable",
@@ -187,8 +209,10 @@ class InternalApiClientTest {
                     return;
                 }
             }
-        } catch (IOException ignored) {
-            // The client gives up when its budget is spent; that is the point.
+        } catch (IOException e) {
+            // The client gave up when its budget was spent; the broken socket
+            // is exactly what this test observes.
+            dripAborted.set(true);
         } finally {
             exchange.close();
         }

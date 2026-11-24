@@ -171,8 +171,11 @@ public class CollectorRunner {
         int maxAttempts = Math.max(1, properties.getReportMaxAttempts());
         long backoff = Math.max(0, properties.getReportBackoffMs());
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            // Check the lease immediately before every send, including retries:
+            // once it is gone the claim token is stale and must not leave the
+            // process.
             long budget = lease.timeoutMs(properties.getReadTimeoutMs());
-            if (budget <= 0) {
+            if (budget <= 0 || lease.expired()) {
                 log.warn("Lease expired before report attempt {} for container_id={}; "
                         + "task will be reclaimed", attempt, task.containerId());
                 return;

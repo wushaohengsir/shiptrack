@@ -123,6 +123,71 @@ class MscProbeBrowserTest {
             </body></html>
             """;
 
+    /**
+     * The visible status says the box is loaded, while an earlier hidden node
+     * inside the same block claims another box was picked up.
+     */
+    private static final String HIDDEN_CONFLICTING_STATUS = """
+            <html><body>
+            <form onsubmit="var c=document.getElementById('container').value;
+              document.getElementById('status').textContent='Status: Loaded on vessel '+c;
+              document.getElementById('result').style.display='block';return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result" style="display:none">
+              <div class="hidden-status" style="display:none">
+                Status: Container picked up MAEU1234567
+              </div>
+              <div id="status"></div>
+              <div class="event">Gate in - 2026-11-21 16:20 CET</div>
+            </div>
+            </body></html>
+            """;
+
+    /** The same container's old result is already on the page and submitting changes nothing. */
+    private static final String STALE_SAME_RESULT = """
+            <html><body>
+            <form onsubmit="return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result">
+              <div>Container MSDU7172233</div>
+              <div id="status">Status: Container picked up</div>
+            </div>
+            </body></html>
+            """;
+
+    /** The same container's old result is on the page, but submitting really refreshes it. */
+    private static final String FRESH_SAME_RESULT = """
+            <html><body>
+            <form onsubmit="document.getElementById('status').textContent='Status: Loaded on vessel';
+              document.getElementById('event').textContent='Loaded on vessel - 2026-11-22 08:00 UTC';
+              return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result">
+              <div>Container MSDU7172233</div>
+              <div id="status">Status: Container in transit</div>
+              <div class="event" id="event"></div>
+            </div>
+            </body></html>
+            """;
+
+    /** The tracking request answers 302 to a final 429 that no longer carries the box number. */
+    private static final String REDIRECTED_TRACK_429 = """
+            <html><body>
+            <form onsubmit="var c=document.getElementById('container').value;
+              fetch('/config');
+              fetch('/track-redirect?container='+c);return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            </body></html>
+            """;
+
     private HttpServer server;
     private PlaywrightBrowserSessionFactory factory;
     private MscProperties properties;
@@ -265,6 +330,39 @@ class MscProbeBrowserTest {
         assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
     }
 
+    @Test
+    void ignoresAHiddenConflictingStatusInsideTheResultBlock() {
+        properties.setStatusSelector("#status, .hidden-status");
+        properties.setBaseUrl(baseUrl("/hidden-status"));
+        TrackingOutcome outcome = probe.query("MSDU7172233");
+        assertThat(outcome).isInstanceOf(TrackingOutcome.Success.class);
+        assertThat(((TrackingOutcome.Success) outcome).parsed().rawStatus())
+                .contains("Loaded on vessel");
+    }
+
+    @Test
+    void neverAdoptsTheSameContainersPreSubmitResult() {
+        properties.setQueryTimeoutMs(1_500);
+        properties.setResultWaitMs(300);
+        properties.setBaseUrl(baseUrl("/stale-same-result"));
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
+    }
+
+    @Test
+    void adoptsTheSameContainersResultOnceThePageReallyRefreshesIt() {
+        properties.setBaseUrl(baseUrl("/fresh-same-result"));
+        TrackingOutcome outcome = probe.query("MSDU7172233");
+        assertThat(outcome).isInstanceOf(TrackingOutcome.Success.class);
+        assertThat(((TrackingOutcome.Success) outcome).parsed().rawStatus())
+                .contains("Loaded on vessel");
+    }
+
+    @Test
+    void followsTheTrackingRedirectToItsFinal429() {
+        properties.setBaseUrl(baseUrl("/redirect-429"));
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.RATE_LIMITED);
+    }
+
     private static AgentErrorCode failure(TrackingOutcome outcome) {
         assertThat(outcome).isInstanceOf(TrackingOutcome.Failure.class);
         return ((TrackingOutcome.Failure) outcome).errorCode();
@@ -289,6 +387,12 @@ class MscProbeBrowserTest {
             case "/background-429" -> respond(exchange, 200, BACKGROUND_200_THEN_TRACK_429);
             case "/background-500" -> respond(exchange, 200, BACKGROUND_500_THEN_RESULT);
             case "/stale-result" -> respond(exchange, 200, STALE_OTHER_RESULT);
+            case "/hidden-status" -> respond(exchange, 200, HIDDEN_CONFLICTING_STATUS);
+            case "/stale-same-result" -> respond(exchange, 200, STALE_SAME_RESULT);
+            case "/fresh-same-result" -> respond(exchange, 200, FRESH_SAME_RESULT);
+            case "/redirect-429" -> respond(exchange, 200, REDIRECTED_TRACK_429);
+            case "/track-redirect" -> redirect(exchange, "/track-final");
+            case "/track-final" -> respond(exchange, 429, "too many requests");
             case "/config" -> respond(exchange, 200, "{\"ok\":true}");
             case "/banner-500" -> respond(exchange, 500, "server error");
             case "/track-429" -> respond(exchange, 429, "too many requests");
@@ -306,6 +410,12 @@ class MscProbeBrowserTest {
             }
             default -> respond(exchange, 404, "not found");
         }
+    }
+
+    private static void redirect(HttpExchange exchange, String location) throws IOException {
+        exchange.getResponseHeaders().add("Location", location);
+        exchange.sendResponseHeaders(302, -1);
+        exchange.close();
     }
 
     private static void respond(HttpExchange exchange, int status, String body) throws IOException {

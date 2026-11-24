@@ -3,27 +3,33 @@ package com.shiptrack.collector.msc;
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.PlaywrightException;
+import com.microsoft.playwright.Request;
 import com.microsoft.playwright.Response;
 import com.microsoft.playwright.TimeoutError;
 import com.shiptrack.collector.browser.BrowserSession;
 import com.shiptrack.collector.browser.BrowserSessionFactory;
 import com.shiptrack.contract.internal.AgentErrorCode;
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
@@ -34,24 +40,36 @@ import java.util.function.Consumer;
  * <p>One attempt has a hard 30-second budget for the whole query. Throttling,
  * browser startup, navigation, form actions, the result wait and DOM capture
  * all share that one absolute deadline (and the caller may pass a shorter one
- * from the claim lease). A 429/5xx from either the page or the tracking request,
- * a captcha, a forced login or a changed selector is classified before it can
- * masquerade as {@code TIMEOUT}. It performs exactly one attempt; retries,
- * mapping and reporting are the caller's responsibility.</p>
+ * from the claim lease). A 429/5xx from either the page or the tracking request
+ * (including after a redirect), a captcha, a forced login or a changed selector
+ * is classified before it can masquerade as {@code TIMEOUT}. It performs
+ * exactly one attempt; retries, mapping and reporting are the caller's
+ * responsibility.</p>
+ *
+ * <p>Playwright objects are not thread-safe. Browser startup, every page call
+ * and session cleanup therefore run on one dedicated thread. When the caller's
+ * budget runs out first, the caller returns immediately and marks the run
+ * abandoned; the worker thread still closes the session when its call finally
+ * returns, so a late session can never be left open.</p>
  */
 @Component
 public class MscProbe implements MscTrackingClient {
 
     private static final Logger log = LoggerFactory.getLogger(MscProbe.class);
     private static final long POLL_INTERVAL_MS = 200;
-    /** Hard cap for closing a session that cannot be cancelled; the budget never waits for it. */
-    private static final long CLEANUP_GRACE_MS = 500;
+    private static final int MAX_REDIRECT_HOPS = 10;
 
     private final BrowserSessionFactory sessionFactory;
     private final MscProperties properties;
     private final MscResultParser parser;
     private final MscErrorClassifier errorClassifier;
     private final QueryCircuitBreaker circuitBreaker;
+
+    /**
+     * Owns Playwright: open, all page work and close happen on this one thread,
+     * as the Playwright threading rules require.
+     */
+    private final ExecutorService browserThread;
 
     /** Earliest time the next carrier request may start, in epoch millis. */
     private long nextQueryAtMillis;
@@ -66,6 +84,11 @@ public class MscProbe implements MscTrackingClient {
         this.parser = parser;
         this.errorClassifier = errorClassifier;
         this.circuitBreaker = circuitBreaker;
+        this.browserThread = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "msc-browser");
+            thread.setDaemon(true);
+            return thread;
+        });
     }
 
     @Override
@@ -88,88 +111,80 @@ public class MscProbe implements MscTrackingClient {
                     "no lease time left for a carrier query");
         }
         long deadline = System.nanoTime() + budget * 1_000_000L;
+        RunToken run = new RunToken();
+        Future<TrackingOutcome> pending;
+        try {
+            pending = browserThread.submit(() -> executeQuery(containerNo, budget, deadline, run));
+        } catch (RejectedExecutionException e) {
+            return new TrackingOutcome.Failure(AgentErrorCode.SOURCE_UNAVAILABLE,
+                    "collector is shutting down");
+        }
+        try {
+            long wait = remainingMsOrZero(deadline);
+            if (wait <= 0) {
+                run.abandon();
+                pending.cancel(true);
+                return timeout("MSC query had no time left to start");
+            }
+            return pending.get(wait, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            // The caller stops waiting, but the worker still owns and closes
+            // the session once its current call returns.
+            run.abandon();
+            pending.cancel(true);
+            circuitBreaker.recordFailure();
+            return timeout("MSC query exceeded its " + budget + "ms budget");
+        } catch (InterruptedException e) {
+            run.abandon();
+            pending.cancel(true);
+            Thread.currentThread().interrupt();
+            return timeout("collector interrupted during the MSC query");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new IllegalStateException("browser query failed", cause);
+        }
+    }
+
+    /**
+     * Runs entirely on the browser thread so startup, page work and cleanup
+     * never overlap with another query using the same Playwright instance.
+     */
+    private TrackingOutcome executeQuery(String containerNo, long budget, long deadline, RunToken run) {
         BrowserSession session = null;
-        ExecutorService opener = null;
         try {
             throttle(deadline);
             long openBudget = remainingMsOrZero(deadline);
             if (openBudget <= 0) {
                 throw new DeadlineExceeded();
             }
-            // Browser startup shares the one absolute deadline. It runs on its
-            // own thread so even a driver that ignores its timeout cannot hold
-            // the caller past the budget; cleanup is bounded separately.
-            opener = Executors.newSingleThreadExecutor(runnable -> {
-                Thread thread = new Thread(runnable, "msc-browser-open");
-                thread.setDaemon(true);
-                return thread;
-            });
-            Future<BrowserSession> pending = opener.submit(() -> sessionFactory.open(openBudget));
-            try {
-                session = pending.get(openBudget, TimeUnit.MILLISECONDS);
-            } catch (TimeoutException e) {
-                pending.cancel(true);
-                circuitBreaker.recordFailure();
-                return timeout("browser startup used the whole query budget");
-            } catch (InterruptedException e) {
-                pending.cancel(true);
-                Thread.currentThread().interrupt();
-                return timeout("collector interrupted during browser startup");
-            } catch (ExecutionException e) {
-                Throwable cause = e.getCause();
-                if (cause instanceof RuntimeException runtime) {
-                    throw runtime;
-                }
-                throw new IllegalStateException("browser startup failed", cause);
+            session = sessionFactory.open(openBudget);
+            if (run.abandoned() || Thread.currentThread().isInterrupted()) {
+                return timeout("MSC query was abandoned before it reached the page");
             }
             if (remainingMsOrZero(deadline) <= 0) {
-                return timeout("browser startup used the whole query budget");
+                throw new DeadlineExceeded();
             }
-            return queryWithSession(session.page(), containerNo, deadline);
+            return queryWithSession(session.page(), containerNo, deadline, run);
         } catch (DeadlineExceeded e) {
-            circuitBreaker.recordFailure();
+            recordFailure(run);
             return timeout("MSC query exceeded its " + budget + "ms budget");
         } catch (TimeoutError e) {
-            circuitBreaker.recordFailure();
+            recordFailure(run);
             return timeout("MSC page timeout: " + firstLine(e.getMessage()));
         } catch (PlaywrightException e) {
-            circuitBreaker.recordFailure();
+            recordFailure(run);
             log.warn("Browser failure while querying {}: {}", containerNo, firstLine(e.getMessage()));
             return new TrackingOutcome.Failure(AgentErrorCode.SOURCE_UNAVAILABLE,
                     "browser error: " + firstLine(e.getMessage()));
         } finally {
-            if (opener != null) {
-                opener.shutdownNow();
-            }
-            closeBounded(session);
+            closeQuietly(session);
         }
     }
 
-    /**
-     * Closes a context on a separate daemon thread with a hard cap. A context
-     * that will not close must not extend the query past its budget.
-     */
-    private static void closeBounded(BrowserSession session) {
-        if (session == null) {
-            return;
-        }
-        Thread closer = new Thread(() -> {
-            try {
-                session.close();
-            } catch (RuntimeException ignored) {
-                // A crashed browser can fail to close; nothing to retry.
-            }
-        }, "msc-browser-close");
-        closer.setDaemon(true);
-        closer.start();
-        try {
-            closer.join(CLEANUP_GRACE_MS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    private TrackingOutcome queryWithSession(Page page, String containerNo, long deadline) {
+    private TrackingOutcome queryWithSession(Page page, String containerNo, long deadline, RunToken run) {
         Response navigation;
         try {
             navigation = page.navigate(properties.getBaseUrl(),
@@ -184,7 +199,7 @@ public class MscProbe implements MscTrackingClient {
                 if (status == 429) {
                     deferAfterRateLimit(navigation);
                 }
-                circuitBreaker.recordFailure();
+                recordFailure(run);
                 return new TrackingOutcome.Failure(statusError, "MSC page returned HTTP " + status);
             }
         }
@@ -194,7 +209,7 @@ public class MscProbe implements MscTrackingClient {
         MscPageSnapshot landing = capture(page, deadline, true);
         Optional<AgentErrorCode> landingError = errorClassifier.classify(landing);
         if (landingError.isPresent()) {
-            return signalFailure(landingError.get(), landing);
+            return signalFailure(landingError.get(), landing, run);
         }
 
         Locator input;
@@ -205,23 +220,31 @@ public class MscProbe implements MscTrackingClient {
         } catch (TimeoutError e) {
             // The form itself is missing: that is selector drift, unless the
             // whole budget is already gone.
-            return formFailure(deadline, "MSC tracking form was not found; the page structure likely changed");
+            return formFailure(deadline, run,
+                    "MSC tracking form was not found; the page structure likely changed");
         }
+
+        // Record what the page already shows for this container. A block that
+        // was there before the click has not been produced by this query, so
+        // it may only be read once the page or the network proves a refresh.
+        ResultIdentity beforeSubmit = visibleResultIdentity(page, containerNo, deadline);
 
         AtomicReference<SubmitResponse> correlated = new AtomicReference<>();
         AtomicReference<SubmitResponse> fallbackError = new AtomicReference<>();
         AtomicReference<SubmitResponse> fallbackAny = new AtomicReference<>();
         // Captured before the click so a 429/5xx from the tracking request is
-        // still seen when the page renders no error text at all. Responses are
-        // tied to the actual tracking call: a background 200 must not mask a
-        // later tracking 429, and a background 5xx must not mask a valid result.
+        // still seen when the page renders no error text at all. A redirect
+        // chain keeps the correlation: the final response of the tracking call
+        // is the one that decides, not the 302 that started it.
         Consumer<Response> responseListener = response -> {
             SubmitResponse signal = submitSignal(response, containerNo);
             if (signal == null) {
                 return;
             }
             if (signal.correlated()) {
-                correlated.compareAndSet(null, signal);
+                // Last response of the chain wins: 302 followed by 429 must end
+                // as RATE_LIMITED.
+                correlated.set(signal);
             } else {
                 fallbackAny.set(signal);
                 if (signal.status() >= 400) {
@@ -236,15 +259,15 @@ public class MscProbe implements MscTrackingClient {
                 page.locator(properties.getSubmitSelector()).first()
                         .click(new Locator.ClickOptions().setTimeout(remainingMs(deadline)));
             } catch (TimeoutError e) {
-                return formFailure(deadline, "MSC tracking form could not be filled or submitted");
+                return formFailure(deadline, run, "MSC tracking form could not be filled or submitted");
             }
 
-            WaitResult wait = waitForResult(page, containerNo, deadline, correlated);
+            WaitResult wait = waitForResult(page, containerNo, deadline, correlated, beforeSubmit);
             MscPageSnapshot snapshot = capture(page, deadline, false);
 
             Optional<AgentErrorCode> error = errorClassifier.classify(snapshot);
             if (error.isPresent()) {
-                return signalFailure(error.get(), snapshot);
+                return signalFailure(error.get(), snapshot, run);
             }
 
             SubmitResponse response = effectiveResponse(correlated, fallbackError, fallbackAny);
@@ -258,22 +281,39 @@ public class MscProbe implements MscTrackingClient {
                     if (response.status() == 429) {
                         deferAfterRateLimit(response.retryAfterSeconds());
                     }
-                    circuitBreaker.recordFailure();
+                    recordFailure(run);
                     return new TrackingOutcome.Failure(code,
                             "MSC tracking request returned HTTP " + response.status());
                 }
             }
             if (remainingMsOrZero(deadline) <= 0) {
-                circuitBreaker.recordFailure();
+                recordFailure(run);
                 return timeout("MSC query exceeded its budget before parsing the result");
+            }
+            // A block that was already visible before submission was never
+            // proven to belong to this query. Publishing it is exactly the
+            // stale-result bug AC-29 forbids.
+            if (wait != WaitResult.RESULT && snapshot.resultBlockText() != null) {
+                recordFailure(run);
+                return timeout("MSC result block was not refreshed for container " + containerNo);
+            }
+            // Re-check the captured block against the pre-submit identity: a
+            // DOM that reverted between the wait and the capture must not be
+            // published as this query's result.
+            if (beforeSubmit != null && snapshot.resultBlockText() != null
+                    && fingerprint(snapshot.resultBlockText()).equals(beforeSubmit.text())
+                    && !(response != null && response.status() >= 200 && response.status() < 300)) {
+                recordFailure(run);
+                return timeout("MSC result block is still the pre-submit result for container "
+                        + containerNo);
             }
 
             try {
                 ParsedTracking parsed = parser.parse(snapshot, containerNo);
-                circuitBreaker.recordSuccess();
+                recordSuccess(run);
                 return new TrackingOutcome.Success(parsed, snapshot);
             } catch (MscParseException e) {
-                circuitBreaker.recordFailure();
+                recordFailure(run);
                 return new TrackingOutcome.Failure(
                         resolveUnparsable(snapshot, containerNo, wait == WaitResult.RESULT),
                         e.getMessage());
@@ -297,11 +337,23 @@ public class MscProbe implements MscTrackingClient {
         return null;
     }
 
-    private TrackingOutcome signalFailure(AgentErrorCode code, MscPageSnapshot snapshot) {
+    private TrackingOutcome signalFailure(AgentErrorCode code, MscPageSnapshot snapshot, RunToken run) {
         if (code != AgentErrorCode.CONTAINER_NOT_FOUND) {
-            circuitBreaker.recordFailure();
+            recordFailure(run);
         }
         return new TrackingOutcome.Failure(code, describe(code, snapshot));
+    }
+
+    private void recordFailure(RunToken run) {
+        if (!run.abandoned()) {
+            circuitBreaker.recordFailure();
+        }
+    }
+
+    private void recordSuccess(RunToken run) {
+        if (!run.abandoned()) {
+            circuitBreaker.recordSuccess();
+        }
     }
 
     private TrackingOutcome timeout(String message) {
@@ -312,8 +364,8 @@ public class MscProbe implements MscTrackingClient {
      * A form timeout means selector drift only while budget remains; once the
      * deadline is gone it is a genuine timeout.
      */
-    private TrackingOutcome formFailure(long deadline, String message) {
-        circuitBreaker.recordFailure();
+    private TrackingOutcome formFailure(long deadline, RunToken run, String message) {
+        recordFailure(run);
         if (remainingMsOrZero(deadline) <= 0) {
             return timeout("MSC query exceeded its budget while " + message);
         }
@@ -338,24 +390,29 @@ public class MscProbe implements MscTrackingClient {
     }
 
     /**
-     * Polls for the page's terminal state: the result block, a captcha/login
-     * signal, or a 429/5xx from the tracking request. This is what lets a
-     * late captcha be reported as such instead of waiting the full budget for
-     * a result selector that will never appear.
+     * Polls for the page's terminal state: a fresh result block, a
+     * captcha/login signal, or a 429/5xx from the tracking request. This is
+     * what lets a late captcha be reported as such instead of waiting the full
+     * budget for a result selector that will never appear.
      */
     private WaitResult waitForResult(Page page, String containerNo, long deadline,
-                                     AtomicReference<SubmitResponse> correlated) {
+                                     AtomicReference<SubmitResponse> correlated,
+                                     ResultIdentity beforeSubmit) {
         long resultDeadline = Math.min(deadline,
                 System.nanoTime() + Math.max(0, properties.getResultWaitMs()) * 1_000_000L);
         while (true) {
-            // A visible block only counts when it names the queried container:
-            // a stale result for another box must not be read as this one's.
-            if (resultBlockNames(page, containerNo, resultDeadline)) {
-                return WaitResult.RESULT;
-            }
+            String text = visibleResultText(page, resultDeadline);
             SubmitResponse response = correlated.get();
             if (response != null && response.status() >= 400) {
                 return WaitResult.HTTP_ERROR;
+            }
+            // A visible block only counts when it names the queried container
+            // and can be shown to belong to this query: either it appeared
+            // after the click, its content changed, or the carrier answered the
+            // tracking request with a final success.
+            if (text != null && normalizeContainer(text).contains(normalizeContainer(containerNo))
+                    && isFresh(beforeSubmit, text, response)) {
+                return WaitResult.RESULT;
             }
             if (errorClassifier.classify(capture(page, deadline, true)).isPresent()) {
                 return WaitResult.SIGNAL;
@@ -368,18 +425,17 @@ public class MscProbe implements MscTrackingClient {
         }
     }
 
-    private boolean resultBlockNames(Page page, String containerNo, long deadline) {
-        try {
-            Locator result = page.locator(properties.getResultSelector()).first();
-            if (result.count() == 0 || !result.isVisible()) {
-                return false;
-            }
-            int timeout = (int) Math.min(500, Math.max(1, remainingMsOrZero(deadline)));
-            String text = result.innerText(new Locator.InnerTextOptions().setTimeout(timeout));
-            return text != null && normalizeContainer(text).contains(normalizeContainer(containerNo));
-        } catch (PlaywrightException e) {
-            return false;
+    private static boolean isFresh(ResultIdentity beforeSubmit, String text, SubmitResponse response) {
+        if (beforeSubmit == null) {
+            // Nothing was visible before the click, so this block is new.
+            return true;
         }
+        if (!fingerprint(text).equals(beforeSubmit.text())) {
+            return true;
+        }
+        // Unchanged text is still fresh when the carrier answered the tracking
+        // request for this container with a final 2xx after the click.
+        return response != null && response.status() >= 200 && response.status() < 300;
     }
 
     private static SubmitResponse effectiveResponse(AtomicReference<SubmitResponse> correlated,
@@ -397,6 +453,10 @@ public class MscProbe implements MscTrackingClient {
         return value == null ? "" : value.toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9]", "");
     }
 
+    private static String fingerprint(String text) {
+        return text == null ? "" : text.replaceAll("\\s+", " ").trim();
+    }
+
     SubmitResponse submitSignal(Response response, String containerNo) {
         if (response == null) {
             return null;
@@ -411,8 +471,15 @@ public class MscProbe implements MscTrackingClient {
             if (!sameDomain(host, baseHost)) {
                 return null;
             }
+            String token = normalizeContainer(containerNo);
+            boolean direct = mentionsContainer(response.request(), token);
+            // Follow the redirect chain: the request that carries the container
+            // number answers with 302, and the final response (possibly a 429)
+            // no longer mentions it. Without the chain the 302 would win and
+            // the rate limit would be reported as a timeout.
+            boolean redirected = followsTrackingRedirect(response.request(), token);
             return new SubmitResponse(response.status(), response.headerValue("retry-after"),
-                    mentionsContainer(response, containerNo));
+                    direct || redirected);
         } catch (RuntimeException e) {
             return null;
         }
@@ -423,21 +490,40 @@ public class MscProbe implements MscTrackingClient {
      * container number. Background beacons and config calls fail this check, so
      * they can never stand in for the tracking response.
      */
-    private static boolean mentionsContainer(Response response, String containerNo) {
-        String token = normalizeContainer(containerNo);
+    private static boolean mentionsContainer(Request request, String token) {
         if (token.isEmpty()) {
             return false;
         }
         try {
-            String url = response.url();
+            String url = request.url();
             if (url != null && normalizeContainer(url).contains(token)) {
                 return true;
             }
-            String postData = response.request().postData();
+            String postData = request.postData();
             return postData != null && normalizeContainer(postData).contains(token);
         } catch (RuntimeException e) {
             return false;
         }
+    }
+
+    private static boolean followsTrackingRedirect(Request request, String token) {
+        if (token.isEmpty()) {
+            return false;
+        }
+        try {
+            Request previous = request.redirectedFrom();
+            int hops = 0;
+            while (previous != null && hops < MAX_REDIRECT_HOPS) {
+                if (mentionsContainer(previous, token)) {
+                    return true;
+                }
+                previous = previous.redirectedFrom();
+                hops++;
+            }
+        } catch (RuntimeException ignored) {
+            // A missing redirect link simply means this response is unrelated.
+        }
+        return false;
     }
 
     private static String hostOf(String url) {
@@ -550,57 +636,146 @@ public class MscProbe implements MscTrackingClient {
 
         boolean passwordField = visible(page, properties.getLoginFieldSelector());
         if (light) {
-            return new MscPageSnapshot(title, url, body, null, List.of(), passwordField, null);
+            return new MscPageSnapshot(title, url, body, null, List.of(), passwordField);
         }
 
         // Read the status and timeline only from the visible result block, and
-        // keep its text so the parser can bind status, events and container
-        // number to the same block.
+        // only from elements that are actually visible. A hidden node inside
+        // the same block can carry another container's "picked up" status; the
+        // page text must never let that become this container's result.
         Locator block = visibleResultBlock(page);
         String blockText = null;
+        boolean ambiguous = false;
+        String statusText = null;
+        List<String> eventLines = new ArrayList<>();
         if (block != null) {
-            try {
-                blockText = block.innerText(
-                        new Locator.InnerTextOptions().setTimeout(captureTimeout(deadline)));
-            } catch (PlaywrightException ignored) {
-                blockText = null;
-            }
+            blockText = innerText(block, captureTimeout(deadline));
             if (blockText != null && blockText.length() > properties.getMaxBodyChars()) {
                 blockText = blockText.substring(0, properties.getMaxBodyChars());
             }
         }
-
-        String statusText = null;
-        List<String> eventLines = new ArrayList<>();
         if (blockText != null) {
-            try {
-                Locator status = block.locator(properties.getStatusSelector());
-                if (status.count() > 0) {
-                    statusText = status.first()
-                            .innerText(new Locator.InnerTextOptions().setTimeout(captureTimeout(deadline)));
-                }
-            } catch (PlaywrightException ignored) {
-                // Optional field: absence is reported by the parser, not here.
+            List<String> statuses = collapseRelated(
+                    visibleTexts(block, properties.getStatusSelector(), deadline));
+            Set<String> distinct = distinctTexts(statuses);
+            if (distinct.size() > 1) {
+                // Two visible, different status values: ownership cannot be
+                // established, so the parser must refuse the block.
+                ambiguous = true;
+            } else if (distinct.size() == 1) {
+                statusText = statuses.getFirst();
             }
 
             try {
                 Locator rows = block.locator(properties.getEventRowSelector());
                 int count = Math.min(rows.count(), 50);
                 for (int i = 0; i < count; i++) {
-                    int rowTimeout = Math.min(500, captureTimeout(deadline));
-                    eventLines.add(rows.nth(i)
-                            .innerText(new Locator.InnerTextOptions().setTimeout(rowTimeout)));
+                    Locator row = rows.nth(i);
+                    if (!row.isVisible()) {
+                        continue;
+                    }
+                    String line = innerText(row, Math.min(500, captureTimeout(deadline)));
+                    if (line != null) {
+                        eventLines.add(line);
+                    }
                 }
             } catch (PlaywrightException ignored) {
                 // Optional: the timeline may be absent on a "no result" page.
             }
         }
 
-        return new MscPageSnapshot(title, url, body, statusText, eventLines, passwordField, blockText);
+        return new MscPageSnapshot(title, url, body, statusText, eventLines,
+                passwordField, blockText, ambiguous);
+    }
+
+    private static List<String> visibleTexts(Locator scope, String selector, long deadline) {
+        List<String> values = new ArrayList<>();
+        try {
+            Locator items = scope.locator(selector);
+            int count = Math.min(items.count(), 20);
+            int timeout = Math.min(500, captureTimeout(deadline));
+            for (int i = 0; i < count; i++) {
+                Locator item = items.nth(i);
+                if (!item.isVisible()) {
+                    continue;
+                }
+                String text = innerText(item, timeout);
+                if (text != null && !text.isBlank()) {
+                    values.add(text.trim());
+                }
+            }
+        } catch (PlaywrightException ignored) {
+            // Optional field: absence is reported by the parser, not here.
+        }
+        return values;
+    }
+
+    /**
+     * Nested selectors often match both a label container and its value, so
+     * their texts contain one another. Those describe one status; only
+     * genuinely different, non-contained texts are treated as a conflict.
+     */
+    private static List<String> collapseRelated(List<String> values) {
+        List<String> collapsed = new ArrayList<>();
+        for (String raw : values) {
+            String normalized = normalizeText(raw);
+            boolean merged = false;
+            for (int i = 0; i < collapsed.size(); i++) {
+                String existing = normalizeText(collapsed.get(i));
+                if (existing.contains(normalized) || normalized.contains(existing)) {
+                    if (normalized.length() > existing.length()) {
+                        collapsed.set(i, raw.trim());
+                    }
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) {
+                collapsed.add(raw.trim());
+            }
+        }
+        return collapsed;
+    }
+
+    private static String normalizeText(String value) {
+        return value == null ? "" : value.toLowerCase(Locale.ROOT).replaceAll("\\s+", " ").trim();
+    }
+
+    private static Set<String> distinctTexts(List<String> values) {
+        Set<String> distinct = new LinkedHashSet<>();
+        for (String value : values) {
+            distinct.add(value.trim().replaceAll("\\s+", " ").toLowerCase(Locale.ROOT));
+        }
+        return distinct;
+    }
+
+    private static String innerText(Locator locator, int timeoutMs) {
+        try {
+            return locator.innerText(new Locator.InnerTextOptions().setTimeout(timeoutMs));
+        } catch (PlaywrightException e) {
+            return null;
+        }
     }
 
     private static int captureTimeout(long deadline) {
         return Math.min(2_000, remainingMs(deadline));
+    }
+
+    private String visibleResultText(Page page, long deadline) {
+        Locator result = visibleResultBlock(page);
+        if (result == null) {
+            return null;
+        }
+        int timeout = (int) Math.min(500, Math.max(1, remainingMsOrZero(deadline)));
+        return innerText(result, timeout);
+    }
+
+    private ResultIdentity visibleResultIdentity(Page page, String containerNo, long deadline) {
+        String text = visibleResultText(page, deadline);
+        if (text == null || !normalizeContainer(text).contains(normalizeContainer(containerNo))) {
+            return null;
+        }
+        return new ResultIdentity(fingerprint(text));
     }
 
     private Locator visibleResultBlock(Page page) {
@@ -644,6 +819,22 @@ public class MscProbe implements MscTrackingClient {
         return line.length() > 300 ? line.substring(0, 300) : line;
     }
 
+    private static void closeQuietly(BrowserSession session) {
+        if (session == null) {
+            return;
+        }
+        try {
+            session.close();
+        } catch (RuntimeException ignored) {
+            // A crashed browser can fail to close; nothing to retry.
+        }
+    }
+
+    @PreDestroy
+    void shutdown() {
+        browserThread.shutdownNow();
+    }
+
     private static void sleep(long millis) {
         try {
             Thread.sleep(Math.max(0, millis));
@@ -674,6 +865,26 @@ public class MscProbe implements MscTrackingClient {
     }
 
     record SubmitResponse(int status, String retryAfterSeconds, boolean correlated) {
+    }
+
+    private record ResultIdentity(String text) {
+    }
+
+    /**
+     * One query attempt. The caller marks it abandoned when its budget runs
+     * out; the worker checks the flag so a late session is closed instead of
+     * being used for a result nobody waits for.
+     */
+    private static final class RunToken {
+        private final AtomicBoolean abandoned = new AtomicBoolean();
+
+        void abandon() {
+            abandoned.set(true);
+        }
+
+        boolean abandoned() {
+            return abandoned.get();
+        }
     }
 
     /** Internal signal that the per-query budget is spent. */

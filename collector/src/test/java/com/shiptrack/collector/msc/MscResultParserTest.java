@@ -290,6 +290,66 @@ class MscResultParserTest {
     }
 
     @Test
+    void excludesAPlannedLoadingFromThePodEta() {
+        String body = """
+                Container MSDU7172233
+                Status: Loaded on vessel
+                Port of Discharge: Vancouver, CA
+                Scheduled loading at Vancouver on 2026-12-06
+                """;
+        assertThat(parser.parse(snapshot(body, null, List.of()), "MSDU7172233").etas()).isEmpty();
+    }
+
+    @Test
+    void excludesAPlannedReturnFromThePodEta() {
+        String body = """
+                Container MSDU7172233
+                Status: Discharged from vessel
+                Port of Discharge: Vancouver, CA
+                Scheduled return at Vancouver on 2026-12-06
+                """;
+        assertThat(parser.parse(snapshot(body, null, List.of()), "MSDU7172233").etas()).isEmpty();
+    }
+
+    @Test
+    void keepsTheArrivalWhenANonArrivalOperationSharesTheBlock() {
+        String body = """
+                Container MSDU7172233
+                Status: Loaded on vessel
+                Port of Discharge: Vancouver, CA
+                Scheduled loading at Shanghai on 2026-12-01
+                Estimated arrival at POD: Dec 06, 2026
+                """;
+        ParsedTracking parsed = parser.parse(snapshot(body, null, List.of()), "MSDU7172233");
+        assertThat(parsed.etas()).hasSize(1);
+        assertThat(parsed.etas().getFirst().milestone()).isEqualTo(TrackedMilestone.POD_ARRIVAL);
+        assertThat(parsed.etas().getFirst().date()).isEqualTo(LocalDate.of(2026, 12, 6));
+    }
+
+    @Test
+    void refusesABlockWithTwoConflictingStatusLines() {
+        String block = """
+                Container MSDU7172233
+                Status: Loaded on vessel
+                Status: Container picked up
+                """;
+        assertThatThrownBy(() -> parser.parse(snapshotWithBlock(block, block), "MSDU7172233"))
+                .isInstanceOf(MscParseException.class)
+                .hasMessageContaining("conflicting status");
+    }
+
+    @Test
+    void refusesAVisibleBlockThatCarriesConflictingValues() {
+        MscPageSnapshot page = new MscPageSnapshot(
+                "Container Tracking", "https://www.msc.com/track",
+                "Container MSDU7172233", "Loaded on vessel", List.of(), false,
+                "Container MSDU7172233\nStatus: Loaded on vessel", true);
+        assertThatThrownBy(() -> parser.parse(page, "MSDU7172233"))
+                .isInstanceOf(MscParseException.class)
+                .hasMessageContaining("conflicting values");
+    }
+
+    @Test
     void excludesACancelledEta() {
         String body = """
                 Container MSDU7172233

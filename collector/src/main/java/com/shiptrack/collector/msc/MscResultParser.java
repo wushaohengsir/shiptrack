@@ -42,12 +42,34 @@ public final class MscResultParser {
             Pattern.compile("(?im)^\\s*(?:current\\s+location|last\\s+known\\s+location|location)\\s*[:\\-]\\s*(.+)$");
 
     /**
-     * Only explicit forecast wording marks a value as an ETA. "Actual arrival
-     * at Vancouver" is a fact, not an estimate, and must not be published as
-     * the POD ETA.
+     * Only explicit forecast wording marks a value as an ETA candidate. "Actual
+     * arrival at Vancouver" is a fact, not an estimate, and must not be
+     * published as the POD ETA.
      */
     private static final Pattern ETA_HINT = Pattern.compile(
             "(?i)\\b(eta|estimated|expected|planned|scheduled)\\b");
+
+    /**
+     * A date is only an arrival estimate when the line says so. "Scheduled
+     * loading at Vancouver" or "Scheduled return at Vancouver" carry forecast
+     * wording and the POD name, but they describe operations that are not the
+     * arrival this task tracks; publishing them would end tracking on the
+     * wrong milestone.
+     */
+    private static final Pattern ARRIVAL_WORDING = Pattern.compile(
+            "(?i)\\b(eta|arrival|arrivals|arrive|arrives|arriving|"
+                    + "expected\\s+arrival|estimated\\s+arrival)\\b");
+
+    /**
+     * Operations that print a date next to a port but are not the arrival.
+     * "Discharge" is deliberately absent: it is also the name of the monitored
+     * node ("Port of Discharge"), and an actual or planned discharge line
+     * without arrival wording is already dropped by the checks below.
+     */
+    private static final Pattern NON_ARRIVAL_OPERATION = Pattern.compile(
+            "(?i)\\b(loading|load|loaded|unloading|unload|"
+                    + "return(?:ed|ing|s)?|pickup|pick\\s+up|delivery|deliver(?:ed|y)?|"
+                    + "available|stow(?:ed|ing)?)\\b");
 
     /**
      * A departure is not an arrival. "Scheduled departure from Vancouver"
@@ -79,12 +101,28 @@ public final class MscResultParser {
         if (block == null || block.isBlank()) {
             throw new MscParseException("no visible result block for container " + containerNo);
         }
+        if (snapshot.resultAmbiguous()) {
+            throw new MscParseException("visible result block shows conflicting values for container "
+                    + containerNo);
+        }
         requireExactlyOneContainer(block, containerNo);
 
-        String rawStatus = firstNonBlank(snapshot.statusText(), match(STATUS_LINE, block));
-        if (rawStatus == null) {
+        List<String> statusLines = matches(STATUS_LINE, block);
+        String rawStatus = snapshot.statusText();
+        if (rawStatus == null || rawStatus.isBlank()) {
+            // Without a visible status element, the block itself must be
+            // unambiguous: two different status values mean ownership of the
+            // result cannot be established.
+            if (distinct(statusLines).size() > 1) {
+                throw new MscParseException("result block shows conflicting status values for container "
+                        + containerNo);
+            }
+            rawStatus = statusLines.isEmpty() ? null : statusLines.getFirst();
+        }
+        if (rawStatus == null || rawStatus.isBlank()) {
             throw new MscParseException("no status text found for container " + containerNo);
         }
+        rawStatus = rawStatus.trim();
 
         String pol = match(POL, block);
         String pod = match(POD, block);
@@ -170,9 +208,11 @@ public final class MscResultParser {
 
     /**
      * A usable ETA line forecasts an arrival and does not talk about a
-     * departure, a cancellation or something that already happened. Those
-     * categories print dates too, but publishing them as the POD arrival would
-     * end tracking on a wrong milestone.
+     * departure, a cancellation, cargo handling (loading/unloading/return) or
+     * something that already happened. Those categories print dates too, but
+     * publishing them as the POD arrival would end tracking on a wrong
+     * milestone. The line must also carry explicit arrival wording, so a bare
+     * "Scheduled at Vancouver on ..." is not bound to the arrival node.
      */
     private static boolean isArrivalForecast(String line) {
         if (StatusWording.isCancelled(line)) {
@@ -181,7 +221,13 @@ public final class MscResultParser {
         if (DEPARTURE_WORDING.matcher(line).find()) {
             return false;
         }
-        return !ACTUAL_TIME_WORDING.matcher(line).find();
+        if (NON_ARRIVAL_OPERATION.matcher(line).find()) {
+            return false;
+        }
+        if (ACTUAL_TIME_WORDING.matcher(line).find()) {
+            return false;
+        }
+        return ARRIVAL_WORDING.matcher(line).find();
     }
 
     private static Optional<TrackedMilestone> etaMilestone(String line, String pod, String finalDestination) {
@@ -265,6 +311,27 @@ public final class MscResultParser {
         return clean(matcher.group(1));
     }
 
+    /** Every distinct value captured by a pattern, in page order. */
+    private static List<String> matches(Pattern pattern, String body) {
+        List<String> values = new ArrayList<>();
+        Matcher matcher = pattern.matcher(body);
+        while (matcher.find()) {
+            String value = clean(matcher.group(1));
+            if (value != null) {
+                values.add(value);
+            }
+        }
+        return values;
+    }
+
+    private static Set<String> distinct(List<String> values) {
+        Set<String> distinct = new java.util.LinkedHashSet<>();
+        for (String value : values) {
+            distinct.add(value.trim().replaceAll("\\s+", " ").toLowerCase(Locale.ROOT));
+        }
+        return distinct;
+    }
+
     private static String clean(String value) {
         if (value == null) {
             return null;
@@ -273,12 +340,4 @@ public final class MscResultParser {
         return cleaned.isEmpty() ? null : cleaned;
     }
 
-    private static String firstNonBlank(String... values) {
-        for (String value : values) {
-            if (value != null && !value.isBlank()) {
-                return value.trim();
-            }
-        }
-        return null;
-    }
 }

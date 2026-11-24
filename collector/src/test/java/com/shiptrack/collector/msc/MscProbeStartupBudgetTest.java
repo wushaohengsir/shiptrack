@@ -38,6 +38,84 @@ class MscProbeStartupBudgetTest {
         assertThat(factory.requestedTimeoutMs).isBetween(1L, 300L);
     }
 
+    @Test
+    void closesASessionThatArrivesAfterTheBudgetExpired() throws Exception {
+        // A driver that ignores interruption returns a real session 400 ms
+        // after the 150 ms budget. The worker must still close it.
+        LateFactory factory = new LateFactory(400);
+        MscProperties properties = new MscProperties();
+        properties.setMinQueryIntervalMs(0);
+        properties.setQueryJitterMs(0);
+        properties.setRateLimitBackoffMs(0);
+        MscProbe probe = new MscProbe(factory, properties, new MscResultParser(),
+                new MscErrorClassifier(properties),
+                new QueryCircuitBreaker(100, Duration.ofSeconds(1), Clock.systemUTC()));
+
+        TrackingOutcome outcome = probe.query("MSDU7172233", 150);
+
+        assertThat(((TrackingOutcome.Failure) outcome).errorCode()).isEqualTo(AgentErrorCode.TIMEOUT);
+        long deadline = System.nanoTime() + 2_000_000_000L;
+        while (!factory.sessionClosed() && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(factory.sessionClosed())
+                .as("the late session must be closed by the worker thread")
+                .isTrue();
+    }
+
+    private static final class LateFactory implements BrowserSessionFactory {
+
+        private final long delayMs;
+        private volatile BrowserSession session;
+        private volatile boolean closed;
+
+        private LateFactory(long delayMs) {
+            this.delayMs = delayMs;
+        }
+
+        @Override
+        public BrowserSession open() {
+            return open(30_000);
+        }
+
+        @Override
+        public BrowserSession open(long timeoutMs) {
+            long end = System.nanoTime() + delayMs * 1_000_000L;
+            while (System.nanoTime() < end) {
+                long left = (end - System.nanoTime()) / 1_000_000L;
+                if (left <= 0) {
+                    break;
+                }
+                try {
+                    Thread.sleep(left);
+                } catch (InterruptedException ignored) {
+                    // Deliberately ignore: the test proves late cleanup.
+                }
+            }
+            BrowserSession late = new BrowserSession() {
+                @Override
+                public com.microsoft.playwright.Page page() {
+                    return null;
+                }
+
+                @Override
+                public void close() {
+                    closed = true;
+                }
+            };
+            session = late;
+            return late;
+        }
+
+        boolean sessionClosed() {
+            return closed;
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
     private static final class SlowFactory implements BrowserSessionFactory {
 
         private final long sleepMs;
