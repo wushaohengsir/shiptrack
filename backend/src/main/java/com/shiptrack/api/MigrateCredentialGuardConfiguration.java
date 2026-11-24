@@ -9,7 +9,7 @@ import org.springframework.core.env.EnumerablePropertySource;
 import org.springframework.core.env.Environment;
 import org.springframework.core.env.PropertySource;
 
-import java.util.Locale;
+import java.util.function.Predicate;
 
 /**
  * Fail-fast guard for the one-shot {@code migrate} profile.
@@ -28,9 +28,10 @@ import java.util.Locale;
  *       exactly those variables, so no higher-precedence source
  *       ({@code SPRING_DATASOURCE_*}, {@code -Dspring.datasource.*} or a command-line
  *       argument) can swap in another account.</li>
- *   <li>{@code spring.datasource.url} must not embed credentials ({@code user=},
- *       {@code password=} or user-info syntax); the MySQL driver would otherwise read
- *       the account from the URL.</li>
+ *   <li>{@code spring.datasource.url} must match the project form enforced by
+ *       {@link MigrateUrlPolicy}: plain host/port/database plus an allow-list of
+ *       connection parameters. Host-level attributes and percent-encoded credential
+ *       keys are rejected, because Connector/J would let them override the account.</li>
  *   <li>{@code spring.flyway.url}, {@code spring.flyway.user},
  *       {@code spring.flyway.password} and {@code spring.datasource.hikari.jdbc-url}
  *       must be absent. Spring Boot builds a separate Flyway {@code DataSource} as soon
@@ -38,6 +39,10 @@ import java.util.Locale;
  *       properties can authenticate as another account even when its text equals the
  *       main datasource URL. Presence is detected in relaxed form, so camelCase,
  *       kebab-case and environment-variable spellings are all caught.</li>
+ *   <li>{@code spring.datasource.type} and Hikari's {@code dataSource}/
+ *       {@code dataSourceClassName}/{@code dataSourceProperties} family must be absent:
+ *       Hikari would otherwise instantiate that class and connect with its own URL and
+ *       properties instead of the guarded datasource.</li>
  * </ol>
  */
 @Configuration(proxyBeanMethods = false)
@@ -53,6 +58,8 @@ class MigrateCredentialGuardConfiguration {
     private static final String FLYWAY_URL_PROPERTY = "spring.flyway.url";
     private static final String FLYWAY_USERNAME_PROPERTY = "spring.flyway.user";
     private static final String FLYWAY_PASSWORD_PROPERTY = "spring.flyway.password";
+    private static final String DATASOURCE_TYPE_PROPERTY = "spring.datasource.type";
+    private static final String HIKARI_DATA_SOURCE_PROPERTY = "spring.datasource.hikari.data-source";
     private static final String USERNAME_VARIABLE = "DB_MIGRATION_USER";
     private static final String PASSWORD_VARIABLE = "DB_MIGRATION_PASSWORD";
 
@@ -70,15 +77,17 @@ class MigrateCredentialGuardConfiguration {
             requireAbsentOrMatchesVariable(environment, HIKARI_USERNAME_PROPERTY, USERNAME_VARIABLE, username);
             requireAbsentOrMatchesVariable(environment, HIKARI_PASSWORD_PROPERTY, PASSWORD_VARIABLE, password);
 
-            String datasourceUrl = requireUrl(environment);
-            requireNoEmbeddedCredentials(datasourceUrl);
+            MigrateUrlPolicy.requireSupported(environment.getProperty(URL_PROPERTY));
 
             // A single controlled datasource only: Flyway must not derive its own
-            // connection, and Hikari must not be pointed at a second URL.
+            // connection, and Hikari must not be pointed at a second URL or at a
+            // replacement DataSource class with its own connection properties.
             requireAbsent(environment, HIKARI_URL_PROPERTY);
             requireAbsent(environment, FLYWAY_URL_PROPERTY);
             requireAbsent(environment, FLYWAY_USERNAME_PROPERTY);
             requireAbsent(environment, FLYWAY_PASSWORD_PROPERTY);
+            requireAbsent(environment, DATASOURCE_TYPE_PROPERTY);
+            requireAbsentPrefix(environment, HIKARI_DATA_SOURCE_PROPERTY);
         };
     }
 
@@ -139,72 +148,37 @@ class MigrateCredentialGuardConfiguration {
         }
     }
 
-    private static String requireUrl(Environment environment) {
-        String url = environment.getProperty(URL_PROPERTY);
-        if (url == null || url.isBlank() || url.startsWith("${")) {
-            throw new IllegalStateException(
-                    "migrate profile requires " + URL_PROPERTY + "; the migration target is not configured");
-        }
-        return url;
-    }
-
-    /** A JDBC URL may select the database, never the account or password. */
-    private static void requireNoEmbeddedCredentials(String url) {
-        if (authorityPart(url).contains("@")) {
-            throw embeddedCredentials();
-        }
-        int queryStart = url.indexOf('?');
-        if (queryStart < 0) {
-            return;
-        }
-        String query = url.substring(queryStart + 1);
-        int fragmentStart = query.indexOf('#');
-        if (fragmentStart >= 0) {
-            query = query.substring(0, fragmentStart);
-        }
-        for (String pair : query.split("[&;]")) {
-            int equals = pair.indexOf('=');
-            String key = (equals >= 0 ? pair.substring(0, equals) : pair).trim();
-            if (key.equalsIgnoreCase("user") || key.equalsIgnoreCase("password")) {
-                throw embeddedCredentials();
-            }
-        }
-    }
-
-    private static String authorityPart(String url) {
-        int schemeEnd = url.indexOf("://");
-        if (schemeEnd < 0) {
-            return "";
-        }
-        int start = schemeEnd + 3;
-        int end = url.length();
-        for (int i = start; i < url.length(); i++) {
-            char character = url.charAt(i);
-            if (character == '/' || character == '?' || character == '#') {
-                end = i;
-                break;
-            }
-        }
-        return url.substring(start, end);
-    }
-
     /**
      * Rejects a property no matter how it is spelled: YAML/property kebab-case,
      * camelCase in a configuration file, or the environment-variable form. Boot's
      * relaxed binding would accept any of them for Flyway/Hikari.
      */
     private static void requireAbsent(Environment environment, String property) {
+        String target = normalise(property);
+        requireNoPropertyNamed(environment, property, name -> normalise(name).equals(target));
+    }
+
+    /**
+     * Rejects a whole property family, e.g. Hikari's {@code data-source},
+     * {@code data-source-class-name} and {@code data-source-properties.*}.
+     */
+    private static void requireAbsentPrefix(Environment environment, String propertyPrefix) {
+        String target = normalise(propertyPrefix);
+        requireNoPropertyNamed(environment, propertyPrefix, name -> normalise(name).startsWith(target));
+    }
+
+    private static void requireNoPropertyNamed(
+            Environment environment, String property, Predicate<String> matches) {
         if (!(environment instanceof ConfigurableEnvironment configurable)) {
             throw new IllegalStateException("migrate profile requires a ConfigurableEnvironment to verify "
                     + property + " is absent");
         }
-        String target = normalise(property);
         for (PropertySource<?> source : configurable.getPropertySources()) {
             if (!(source instanceof EnumerablePropertySource<?> enumerable)) {
                 continue;
             }
             for (String name : enumerable.getPropertyNames()) {
-                if (normalise(name).equals(target)) {
+                if (matches.test(name)) {
                     throw forbiddenProperty(property);
                 }
             }
@@ -245,10 +219,5 @@ class MigrateCredentialGuardConfiguration {
         return new IllegalStateException("migrate profile forbids " + property
                 + "; the migration must use the single datasource configured by DB_MIGRATION_USER"
                 + " and DB_MIGRATION_PASSWORD");
-    }
-
-    private static IllegalStateException embeddedCredentials() {
-        return new IllegalStateException("migrate profile forbids credentials embedded in "
-                + URL_PROPERTY + "; use DB_MIGRATION_USER and DB_MIGRATION_PASSWORD instead");
     }
 }

@@ -28,6 +28,11 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * of {@code spring.flyway.url/user/password} or {@code spring.datasource.hikari.jdbc-url}
  * is rejected even when the value matches the guarded one, including relaxed spellings,
  * and a {@code spring.datasource.url} carrying credentials is rejected outright.
+ * Hikari's replacement {@code DataSource} family ({@code spring.datasource.type},
+ * {@code data-source}, {@code data-source-class-name}, {@code data-source-properties.*})
+ * is rejected too, and the URL must match the project form: host/port/database plus
+ * approved parameters, so host-level attributes and percent-encoded credential keys
+ * cannot reach the driver.
  */
 class MigrateProfileFailsFastTest {
 
@@ -73,6 +78,20 @@ class MigrateProfileFailsFastTest {
     private static final String EMBEDDED_CREDENTIALS_MESSAGE =
             "migrate profile forbids credentials embedded in spring.datasource.url;"
                     + " use DB_MIGRATION_USER and DB_MIGRATION_PASSWORD instead";
+    private static final String HOST_LEVEL_ATTRIBUTES_MESSAGE =
+            "migrate profile forbids host-level attributes in spring.datasource.url;"
+                    + " only <host>[:<port>]/<database> is allowed";
+    private static final String UNSUPPORTED_URL_MESSAGE =
+            "migrate profile requires spring.datasource.url to be"
+                    + " jdbc:mysql://<host>[:<port>]/<database> with only approved connection parameters";
+    private static final String FORBIDDEN_DATASOURCE_TYPE_MESSAGE =
+            "migrate profile forbids spring.datasource.type;"
+                    + " the migration must use the single datasource configured by DB_MIGRATION_USER"
+                    + " and DB_MIGRATION_PASSWORD";
+    private static final String FORBIDDEN_HIKARI_DATA_SOURCE_MESSAGE =
+            "migrate profile forbids spring.datasource.hikari.data-source;"
+                    + " the migration must use the single datasource configured by DB_MIGRATION_USER"
+                    + " and DB_MIGRATION_PASSWORD";
 
     @Test
     void missingMigrationUserAbortsStartup() {
@@ -265,6 +284,71 @@ class MigrateProfileFailsFastTest {
                 completeCredentials(),
                 EMBEDDED_CREDENTIALS_MESSAGE,
                 "--spring.datasource.url=jdbc:mysql://shiptrack_runtime:secret@db.example:3306/shiptrack");
+    }
+
+    @Test
+    void datasourceUrlWithHostLevelCredentialsIsRejected() {
+        // Connector/J applies host-level attributes after the global connection
+        // properties, so the driver would use this account even though Hikari passes
+        // DB_MIGRATION_USER/DB_MIGRATION_PASSWORD (R-B3-3).
+        assertGuardRejects(
+                completeCredentials(),
+                HOST_LEVEL_ATTRIBUTES_MESSAGE,
+                "--spring.datasource.url=jdbc:mysql://address=(host=db.example)(port=3306)"
+                        + "(user=shiptrack_runtime)(password=secret)/shiptrack");
+    }
+
+    @Test
+    void datasourceUrlWithPercentEncodedCredentialKeyIsRejected() {
+        // %75ser decodes to "user"; a plain-text key scan would miss it.
+        assertGuardRejects(
+                completeCredentials(),
+                UNSUPPORTED_URL_MESSAGE,
+                "--spring.datasource.url=jdbc:mysql://db.example:3306/shiptrack?%75ser=shiptrack_runtime");
+    }
+
+    @Test
+    void datasourceUrlWithUnapprovedParameterIsRejected() {
+        assertGuardRejects(
+                completeCredentials(),
+                UNSUPPORTED_URL_MESSAGE,
+                "--spring.datasource.url=jdbc:mysql://db.example:3306/shiptrack?autoReconnect=true");
+    }
+
+    @Test
+    void datasourceTypeIsForbidden() {
+        // A replacement DataSource implementation would not use the guarded connection.
+        assertGuardRejects(
+                completeCredentials(),
+                FORBIDDEN_DATASOURCE_TYPE_MESSAGE,
+                "--spring.datasource.type=com.zaxxer.hikari.HikariDataSource");
+    }
+
+    @Test
+    void hikariDataSourceClassNameIsForbidden() {
+        // Hikari instantiates the named class and connects with its own URL and
+        // properties, bypassing the guarded datasource (R-B3-3).
+        assertGuardRejects(
+                completeCredentials(),
+                FORBIDDEN_HIKARI_DATA_SOURCE_MESSAGE,
+                "--spring.datasource.hikari.data-source-class-name=com.mysql.cj.jdbc.MysqlDataSource");
+    }
+
+    @Test
+    void relaxedHikariDataSourceClassNameSpellingIsForbidden() {
+        assertGuardRejects(
+                completeCredentials(),
+                FORBIDDEN_HIKARI_DATA_SOURCE_MESSAGE,
+                "--spring.datasource.hikari.dataSourceClassName=com.mysql.cj.jdbc.MysqlDataSource");
+    }
+
+    @Test
+    void hikariDataSourcePropertiesAreForbidden() {
+        assertGuardRejects(
+                completeCredentials(),
+                FORBIDDEN_HIKARI_DATA_SOURCE_MESSAGE,
+                "--spring.datasource.hikari.data-source-properties.url="
+                        + "jdbc:mysql://override.example:3306/shiptrack");
     }
 
     @Test

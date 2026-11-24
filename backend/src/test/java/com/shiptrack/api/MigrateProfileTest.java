@@ -21,6 +21,7 @@ import java.sql.Statement;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -99,6 +100,10 @@ class MigrateProfileTest {
         // uses, so an independent spring.flyway.* override cannot slip through (R-B3-3).
         DataSource flywayDataSource = flyway.getConfiguration().getDataSource();
         assertNotNull(flywayDataSource, "Flyway must run against a concrete DataSource");
+        // The migrate profile builds one controlled DataSource; Flyway must consume that
+        // very instance rather than one derived from other configuration.
+        assertSame(dataSource, flywayDataSource,
+                "Flyway must use the single controlled migration DataSource");
 
         try (Connection connection = flywayDataSource.getConnection();
              Statement statement = connection.createStatement();
