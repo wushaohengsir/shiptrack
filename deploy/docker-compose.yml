@@ -87,8 +87,19 @@ services:
       DB_URL: "jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-shiptrack}?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC&useSSL=false&allowPublicKeyRetrieval=true"
       DB_USER: ${DB_APP_USER:-shiptrack_app}
       DB_PASSWORD: ${DB_APP_PASSWORD:?set DB_APP_PASSWORD in deploy/.env}
+      # §1.2 / §5.22: public Bearer token and the collector-only token. Both
+      # are mandatory: with either blank the API fails closed (401).
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN in deploy/.env}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:?set INTERNAL_TOKEN in deploy/.env}
+      CONFIG_PATH: /app/config/config.yaml
+      STATUS_MAPPING_PATH: /app/config/status-mappings.yaml
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-false}
+      TASK_CLAIM_TIMEOUT_MS: ${TASK_CLAIM_TIMEOUT_MS:-900000}
       JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:--Xms256m -Xmx512m}
       TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # Read-only config for GET /config and GET /config/status-mappings.
+      - ../config:/app/config:ro
     ports:
       # Loopback only. Public traffic must go through the HTTPS reverse proxy.
       - "127.0.0.1:${APP_HOST_PORT:-8080}:8080"

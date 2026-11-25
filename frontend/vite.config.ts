@@ -22,6 +22,14 @@ export default defineConfig({
   },
   server: {
     host: '127.0.0.1',
-    port: 5173
+    port: 5173,
+    // Same-origin in dev: the browser calls `/api/v1/...` and Vite forwards
+    // `/api` to the Spring API, so http mode needs no CORS or absolute base.
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8080',
+        changeOrigin: false
+      }
+    }
   }
 })

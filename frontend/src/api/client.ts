@@ -8,7 +8,7 @@ export type ApiMode = 'mock' | 'http'
 
 const configuredMode = (import.meta.env.VITE_API_MODE ?? 'mock').toLowerCase()
 export const apiMode: ApiMode = configuredMode === 'http' ? 'http' : 'mock'
-export const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '/api').replace(/\/+$/, '')
+export const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '/api/v1').replace(/\/+$/, '')
 
 export class ApiError extends Error {
   readonly status: number
