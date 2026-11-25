@@ -117,6 +117,84 @@ services:
     cap_drop:
       - ALL
     stop_grace_period: 30s
+    healthcheck:
+      # GET /api/v1/health is the public probe (no bearer token). When MySQL is
+      # unreachable it answers non-2xx (observed 500) or a non-ok body, so
+      # require an `ok` body: `collector` and `web` must not start against a
+      # database-less API. curl ships with the eclipse-temurin JRE base image.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/v1/health | grep -q '\"status\":\"ok\"'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # Browser crawler. A separate image (Chromium + Playwright) that reaches the
+  # API only through the compose network with X-Internal-Token. It never
+  # receives DB_* credentials and publishes no host port.
+  collector:
+    build:
+      context: ..
+      dockerfile: collector/Dockerfile
+    image: shiptrack-collector:${APP_IMAGE_TAG:-local}
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      COLLECTOR_BASE_URL: http://app:8080
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:?set INTERNAL_TOKEN in deploy/.env}
+      MAPPING_PATH: /app/config/status-mappings.yaml
+      TASK_CLAIM_TIMEOUT_MS: ${TASK_CLAIM_TIMEOUT_MS:-900000}
+      COLLECTOR_POLL_INTERVAL_MS: ${COLLECTOR_POLL_INTERVAL_MS:-30000}
+      JAVA_TOOL_OPTIONS: ${COLLECTOR_JAVA_TOOL_OPTIONS:--Xms128m -Xmx512m}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # The API owns this file and bumps `version` on every change.
+      - ../config:/app/config:ro
+    # Chromium needs shared memory larger than the 64 MB default.
+    shm_size: "1gb"
+    # The Docker default seccomp profile blocks the clone/unshare flags Chromium
+    # needs; this profile only adds those syscalls back.
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=../collector/seccomp-chromium.json
+    read_only: true
+    tmpfs:
+      # Chromium and the JVM write below /tmp; Playwright also uses $HOME.
+      # pwuser is uid/gid 1001 in the Playwright base image, so the tmpfs must
+      # be owned by 1001:1001 and mode 0700; the default (root:root 0750) leaves
+      # $HOME unwritable even though Chromium currently only touches /tmp.
+      - /tmp
+      - /home/pwuser:uid=1001,gid=1001,mode=0700
+    cap_drop:
+      - ALL
+    stop_grace_period: 20s
+
+  # Static SPA plus the reverse proxy for /api/. The bundle talks to the API
+  # same-origin, so no CORS rule or absolute API URL is baked in.
+  web:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_MODE: http
+        VITE_API_BASE_URL: /api/v1
+    image: shiptrack-web:${APP_IMAGE_TAG:-local}
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      # Loopback only, same rule as the API: publish through the HTTPS proxy.
+      - "127.0.0.1:${WEB_HOST_PORT:-8088}:8080"
+    read_only: true
+    tmpfs:
+      # pid file and proxy body buffers live under /tmp.
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
 volumes:
   mysql-data:
