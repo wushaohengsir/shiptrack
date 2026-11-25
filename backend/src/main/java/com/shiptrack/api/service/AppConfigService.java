@@ -1,6 +1,7 @@
 package com.shiptrack.api.service;
 
 import com.shiptrack.api.config.ApiProperties;
+import com.shiptrack.api.config.FeishuProperties;
 import com.shiptrack.api.error.ApiException;
 import com.shiptrack.contract.dto.AppConfigDto;
 import com.shiptrack.contract.dto.StatusMappingDto;
@@ -32,9 +33,11 @@ public class AppConfigService {
     private static final Logger log = LoggerFactory.getLogger(AppConfigService.class);
 
     private final ApiProperties properties;
+    private final FeishuProperties feishu;
 
-    public AppConfigService(ApiProperties properties) {
+    public AppConfigService(ApiProperties properties, FeishuProperties feishu) {
         this.properties = properties;
+        this.feishu = feishu;
     }
 
     public AppConfigDto get() {
@@ -114,10 +117,13 @@ public class AppConfigService {
         return new StatusMappingsDto(version, updatedAt, mappings);
     }
 
+    /**
+     * §5.15: {@code true} only when both the URL and the signature secret are
+     * configured. The sender itself only needs the URL, but the public flag
+     * keeps the documented "fully configured" meaning.
+     */
     public boolean feishuWebhookConfigured() {
-        String url = System.getenv("FEISHU_WEBHOOK_URL");
-        String secret = System.getenv("FEISHU_WEBHOOK_SECRET");
-        return url != null && !url.isBlank() && secret != null && !secret.isBlank();
+        return feishu.isConfigured() && feishu.hasSecret();
     }
 
     @SuppressWarnings("unchecked")

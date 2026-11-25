@@ -23,9 +23,9 @@ import java.util.Map;
 /**
  * Order-level aggregation after the last terminal result of a run (§8.6).
  *
- * <p>Only the database side is implemented in M3: the notification row and the
- * event links are written as {@code pending}. A Feishu dispatcher can poll that
- * queue (see {@link #dispatchHook()}); sending is out of scope.</p>
+ * <p>This service only writes the database side: the {@code pending}
+ * notification row and its event links. {@code NotificationDispatchService}
+ * consumes that queue after the transaction commits (§8.6).</p>
  */
 @Service
 public class AggregationService {
@@ -85,12 +85,6 @@ public class AggregationService {
         log.info("notification queued: {} ({} events)", key, eligible.size());
         return new OrderNotificationResult(
                 OrderNotificationState.CREATED, notificationId, NotificationStatus.PENDING);
-    }
-
-    /**
-     * Deliberately empty seam for the §7 Feishu dispatcher (out of scope in M3).
-     */
-    public void dispatchHook() {
     }
 
     private boolean isEligible(EventRecord event, AppConfigService.AppConfigValues values) {
