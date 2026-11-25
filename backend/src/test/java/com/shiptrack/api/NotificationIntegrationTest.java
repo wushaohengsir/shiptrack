@@ -403,13 +403,13 @@ class NotificationIntegrationTest {
         String run1 = refreshContainer(containerId);
         report(run1, containerId, (String) claim(run1).get("claim_token"),
                 dateTimeEta("2026-12-07", "23:30", "America/Vancouver",
-                        "2026-12-08T07:30:00Z"),
+                        "2026-12-08T06:30:00Z"),
                 List.of(loadedEvent()), "DEPARTED");
         String run2 = refreshContainer(containerId);
         Map<String, Object> reportBody = report(run2, containerId,
                 (String) claim(run2).get("claim_token"),
                 dateTimeEta("2026-12-09", "00:30", "America/Vancouver",
-                        "2026-12-09T08:30:00Z"),
+                        "2026-12-09T07:30:00Z"),
                 List.of(loadedEvent()), "DEPARTED");
         assertEquals("created",
                 ((Map<?, ?>) reportBody.get("order_notification")).get("state"));
@@ -430,22 +430,22 @@ class NotificationIntegrationTest {
         long orderId = ((Number) order.get("id")).longValue();
         long containerId = firstContainerId(order);
 
-        // America/Vancouver falls back on 2026-11-01: 01:30 local happens twice,
-        // at 08:30Z (PDT) and 09:30Z (PST). The first ETA is the second 01:30
-        // (09:30Z); the second ETA is 01:30 the next day (2026-11-02T09:30Z).
+        // America/New_York falls back on 2026-11-01: 01:30 local happens twice,
+        // at 05:30Z (EDT) and 06:30Z (EST). The first ETA is the second 01:30
+        // (06:30Z); the second ETA is 01:30 the next day (2026-11-02T06:30Z).
         // Their utc_at differ by 24 hours, but rebuilding the first instant from
-        // its wall clock picks the earlier PDT offset (08:30Z), which would make
+        // its wall clock picks the earlier EDT offset (05:30Z), which would make
         // "较上次" 25 hours and disagree with the 24-hour baseline delta.
         String run1 = refreshContainer(containerId);
         report(run1, containerId, (String) claim(run1).get("claim_token"),
-                dateTimeEta("2026-11-01", "01:30", "America/Vancouver",
-                        "2026-11-01T09:30:00Z"),
+                dateTimeEta("2026-11-01", "01:30", "America/New_York",
+                        "2026-11-01T06:30:00Z"),
                 List.of(loadedEvent()), "DEPARTED");
         String run2 = refreshContainer(containerId);
         Map<String, Object> reportBody = report(run2, containerId,
                 (String) claim(run2).get("claim_token"),
-                dateTimeEta("2026-11-02", "01:30", "America/Vancouver",
-                        "2026-11-02T09:30:00Z"),
+                dateTimeEta("2026-11-02", "01:30", "America/New_York",
+                        "2026-11-02T06:30:00Z"),
                 List.of(loadedEvent()), "DEPARTED");
         assertEquals("created",
                 ((Map<?, ?>) reportBody.get("order_notification")).get("state"));
