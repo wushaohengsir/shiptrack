@@ -74,7 +74,8 @@ docker compose logs --tail=50 web
 `migrate` 退出码非 0 时，`app` 不会被创建或启动，`docker compose ps` 里看不到 `app`。
 迁移日志出现 `Successfully applied`、应用日志出现 `Started ApiApplication` 即成功。
 `app` 的健康检查探测 `GET /api/v1/health` 并要求返回体里 `status` 为 `ok`；
-数据库不可达时该接口返回 `status: down`，`collector` 与 `web` 会保持等待。
+数据库不可达时该接口返回非 2xx（实测 500）或顶层非 `ok`，探针据此判定不健康，
+`collector` 与 `web` 会保持等待。
 
 ## 4. 验证
 
@@ -175,7 +176,7 @@ docker compose exec -T mysql sh -c \
 
 ```bash
 docker compose logs -f collector        # 观察轮询与采集
-docker compose exec collector id        # 期望 uid=1000(pwuser)，不是 root
+docker compose exec collector id        # 期望 uid=1001(pwuser)，不是 root
 ```
 
 ## 9. web（nginx + SPA）
@@ -188,6 +189,8 @@ docker compose exec collector id        # 期望 uid=1000(pwuser)，不是 root
 nginx 行为：
 
 - `/api/` 原样反代到 `http://app:8080`，附带 `X-Forwarded-*`，响应不缓存；
+- `/internal` 与 `/internal/` 显式返回 **404**（架构终稿要求内部接口不对外暴露），
+  不会落进 SPA 回退而返回 200 的 HTML；
 - 其余路径 `try_files ... /index.html`，支持前端 history 路由；
 - 带哈希的 `/assets/` 长缓存 30 天，`index.html` 不缓存；
 - 基础安全头（`X-Content-Type-Options`、`X-Frame-Options`、`Referrer-Policy`）与 gzip；

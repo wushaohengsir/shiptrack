@@ -118,8 +118,8 @@ services:
       - ALL
     stop_grace_period: 30s
     healthcheck:
-      # GET /api/v1/health is the public probe (no bearer token). It always
-      # answers 200 and reports `status: down` when MySQL is unreachable, so
+      # GET /api/v1/health is the public probe (no bearer token). When MySQL is
+      # unreachable it answers non-2xx (observed 500) or a non-ok body, so
       # require an `ok` body: `collector` and `web` must not start against a
       # database-less API. curl ships with the eclipse-temurin JRE base image.
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/v1/health | grep -q '\"status\":\"ok\"'"]
@@ -161,8 +161,11 @@ services:
     read_only: true
     tmpfs:
       # Chromium and the JVM write below /tmp; Playwright also uses $HOME.
+      # pwuser is uid/gid 1001 in the Playwright base image, so the tmpfs must
+      # be owned by 1001:1001 and mode 0700; the default (root:root 0750) leaves
+      # $HOME unwritable even though Chromium currently only touches /tmp.
       - /tmp
-      - /home/pwuser
+      - /home/pwuser:uid=1001,gid=1001,mode=0700
     cap_drop:
       - ALL
     stop_grace_period: 20s
