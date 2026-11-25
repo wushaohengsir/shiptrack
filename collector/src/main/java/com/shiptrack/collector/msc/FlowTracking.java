@@ -75,8 +75,13 @@ final class FlowTracking {
             return Optional.empty();
         }
 
-        String pod = firstLocation(events, ARRIVAL)
-                .orElseGet(() -> summary.get("pod"));
+        // An explicit summary POD is authoritative and unique. Only when the
+        // card names no POD may the timeline supply one; otherwise an arrival
+        // at another port (Seattle) would overwrite Vancouver.
+        String explicitPod = explicitPod(summary);
+        String pod = explicitPod != null
+                ? explicitPod
+                : firstLocation(events, ARRIVAL).orElse(null);
         String pol = firstLocation(events, EXPORT_LOAD)
                 .orElseGet(() -> firstLocation(events, EXPORT).orElse(summary.get("pol")));
         String transshipment = events.stream()
@@ -128,7 +133,8 @@ final class FlowTracking {
     }
 
     String pod() {
-        return firstLocation(events, ARRIVAL).orElse(summary.get("pod"));
+        String explicit = explicitPod(summary);
+        return explicit != null ? explicit : firstLocation(events, ARRIVAL).orElse(null);
     }
 
     String transshipmentPort() {
@@ -180,6 +186,7 @@ final class FlowTracking {
                                           EtaTextParser.DateOrder order) {
         List<RawEta> etas = new ArrayList<>();
         String podEta = summary.get("pod eta");
+        boolean summaryEtaAdded = false;
         if (podEta != null) {
             Optional<LocalDate> date = EtaTextParser.parseDate(podEta, order);
             if (date.isPresent()) {
@@ -190,23 +197,32 @@ final class FlowTracking {
                         date.get(),
                         time.map(EtaTextParser.ZonedTime::time).orElse(null),
                         time.map(EtaTextParser.ZonedTime::timezone).orElse(null)));
+                summaryEtaAdded = true;
             }
         }
-        for (FlowEvent event : events) {
-            if (event.date() == null || !ARRIVAL.matcher(event.description()).find()) {
-                continue;
+        // The summary "POD ETA" is the authoritative estimate: it is only used
+        // to fall back when the summary carries no readable date.
+        if (!summaryEtaAdded) {
+            for (FlowEvent event : events) {
+                if (event.date() == null
+                        || event.eventTimeType() != EventTimeType.PLANNED
+                        || !ARRIVAL.matcher(event.description()).find()) {
+                    continue;
+                }
+                // An estimate is only the POD arrival when it is planned and
+                // names the explicit POD. A cancelled or actual arrival is a
+                // timeline fact, and another port's arrival is not this node.
+                if (pod == null || event.location() == null || !samePlace(event.location(), pod)) {
+                    continue;
+                }
+                Optional<EtaTextParser.ZonedTime> time = EtaTextParser.parseTime(event.rawText());
+                etas.add(new RawEta(
+                        TrackedMilestone.POD_ARRIVAL,
+                        event.rawText(),
+                        event.date(),
+                        time.map(EtaTextParser.ZonedTime::time).orElse(null),
+                        time.map(EtaTextParser.ZonedTime::timezone).orElse(null)));
             }
-            // An arrival at a transshipment port is not the monitored POD.
-            if (pod != null && event.location() != null && !samePlace(event.location(), pod)) {
-                continue;
-            }
-            Optional<EtaTextParser.ZonedTime> time = EtaTextParser.parseTime(event.rawText());
-            etas.add(new RawEta(
-                    TrackedMilestone.POD_ARRIVAL,
-                    event.rawText(),
-                    event.date(),
-                    time.map(EtaTextParser.ZonedTime::time).orElse(null),
-                    time.map(EtaTextParser.ZonedTime::timezone).orElse(null)));
         }
         return dedupe(etas);
     }
@@ -228,6 +244,12 @@ final class FlowTracking {
             }
         }
         return Optional.empty();
+    }
+
+    /** The explicit POD summary cell, or null when the card does not name one. */
+    private static String explicitPod(Map<String, String> summary) {
+        String pod = summary.get("pod");
+        return pod == null || pod.isBlank() ? null : pod;
     }
 
     private static String firstSummary(Map<String, String> summary, String... keys) {

@@ -29,6 +29,7 @@ class MscProbeBrowserTest {
     private static final String OK_PAGE = """
             <html><body>
             <form onsubmit="var c=document.getElementById('container').value;
+              fetch('/track-200?container='+c);
               document.getElementById('status').textContent='Status: Loaded on vessel '+c;
               document.getElementById('result').style.display='block';return false;">
               <input id="container" name="container">
@@ -100,6 +101,7 @@ class MscProbeBrowserTest {
             <html><body>
             <form onsubmit="var c=document.getElementById('container').value;
               fetch('/banner-500');
+              fetch('/track-200?container='+c);
               document.getElementById('status').textContent='Status: Loaded on vessel '+c;
               document.getElementById('result').style.display='block';return false;">
               <input id="container" name="container">
@@ -130,6 +132,7 @@ class MscProbeBrowserTest {
     private static final String HIDDEN_CONFLICTING_STATUS = """
             <html><body>
             <form onsubmit="var c=document.getElementById('container').value;
+              fetch('/track-200?container='+c);
               document.getElementById('status').textContent='Status: Loaded on vessel '+c;
               document.getElementById('result').style.display='block';return false;">
               <input id="container" name="container">
@@ -159,12 +162,19 @@ class MscProbeBrowserTest {
             </body></html>
             """;
 
-    /** The same container's old result is on the page, but submitting really refreshes it. */
+    /**
+     * The same container's old result is on the page, but submitting really
+     * rebuilds the result content with a new status.
+     */
     private static final String FRESH_SAME_RESULT = """
             <html><body>
-            <form onsubmit="document.getElementById('status').textContent='Status: Loaded on vessel';
-              document.getElementById('event').textContent='Loaded on vessel - 2026-11-22 08:00 UTC';
-              return false;">
+            <form onsubmit="fetch('/track-200?container=MSDU7172233');
+              var r=document.getElementById('result');
+              var a=document.createElement('div'); a.textContent='Container MSDU7172233';
+              var b=document.createElement('div'); b.id='status'; b.textContent='Status: Loaded on vessel';
+              var e=document.createElement('div'); e.className='event'; e.id='event';
+              e.textContent='Loaded on vessel - 2026-11-22 08:00 UTC';
+              r.replaceChildren(a,b,e);return false;">
               <input id="container" name="container">
               <button id="track" type="submit">Track</button>
             </form>
@@ -251,13 +261,38 @@ class MscProbeBrowserTest {
             """;
 
     /**
+     * The seventh-review repro: the tracking call answers 200, the page first
+     * rewrites the existing timeline row's text, and only 900 ms later changes
+     * the status. Rewriting a stamped node must never count as freshness.
+     */
+    private static final String STAGED_RENDER_EDITS_ROW_FIRST = """
+            <html><body>
+            <form onsubmit="var c=document.getElementById('container').value;
+              fetch('/track-200?container='+c);
+              document.getElementById('old-row').textContent='Gate in - updated';
+              setTimeout(function(){
+                document.getElementById('status').textContent='Status: Loaded on vessel';},900);
+              return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result">
+              <div>Container MSDU7172233</div>
+              <div id="status">Status: Container picked up</div>
+              <div class="event" id="old-row">Gate in - 2026-11-21 16:20 CET</div>
+            </div>
+            </body></html>
+            """;
+
+    /**
      * Two pre-existing blocks for the same container. Submitting only swaps
-     * their visibility; no request is made and no content changes. The hidden
-     * "picked up" block is revealed, which must not count as a fresh result.
+     * their visibility and the tracking call answers 200. The hidden "picked
+     * up" block is revealed, which must not count as a fresh result.
      */
     private static final String STAGED_REVEAL_SECOND_BLOCK = """
             <html><body>
-            <form onsubmit="document.getElementById('block-a').style.display='none';
+            <form onsubmit="fetch('/track-200?container=MSDU7172233');
+              document.getElementById('block-a').style.display='none';
               document.getElementById('block-b').style.display='block';return false;">
               <input id="container" name="container">
               <button id="track" type="submit">Track</button>
@@ -278,7 +313,8 @@ class MscProbeBrowserTest {
     /** A real render replaces the result nodes but leaves the status unchanged. */
     private static final String REAL_RENDER_SAME_STATUS = """
             <html><body>
-            <form onsubmit="var r=document.getElementById('result');
+            <form onsubmit="fetch('/track-200?container=MSDU7172233');
+              var r=document.getElementById('result');
               var a=document.createElement('div'); a.textContent='Container MSDU7172233';
               var b=document.createElement('div'); b.id='status';
               b.textContent='Status: Container picked up';
@@ -302,7 +338,8 @@ class MscProbeBrowserTest {
      */
     private static final String LIVE_STRUCTURE_PAGE = """
             <html><body>
-            <form onsubmit="var t=document.getElementById('live-template');
+            <form onsubmit="fetch('/track-200?container=MSDU7172233');
+              var t=document.getElementById('live-template');
               document.getElementById('live-result').appendChild(t.content.cloneNode(true));return false;">
               <input placeholder="Container number" name="trackingNumber">
               <button type="submit">Track</button>
@@ -594,15 +631,14 @@ class MscProbeBrowserTest {
     }
 
     @Test
-    void waitsForTheRenderEvenWhenTheTrackingCallReturned200Early() {
+    void neverAdoptsThePreSubmitBlockJustBecauseTheTrackingCallReturned200() {
+        // The 200 arrives first and the old block is then edited in place. A
+        // surviving stamp proves this is still the pre-submit result, so the
+        // probe must time out instead of publishing "Container picked up".
         properties.setQueryTimeoutMs(3_000);
-        properties.setResultWaitMs(3_000);
+        properties.setResultWaitMs(2_000);
         properties.setBaseUrl(baseUrl("/track-200-before-render"));
-        TrackingOutcome outcome = probe.query("MSDU7172233");
-
-        assertThat(outcome).isInstanceOf(TrackingOutcome.Success.class);
-        assertThat(((TrackingOutcome.Success) outcome).parsed().rawStatus())
-                .contains("Loaded on vessel");
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
     }
 
     @Test
@@ -617,15 +653,23 @@ class MscProbeBrowserTest {
 
     @Test
     void doesNotPublishTheOldStatusWhenTheStagedRenderDropsARowFirst() {
+        // The stamped block survives (it only lost a row), so no path may
+        // adopt it. Timing out is the correct, safe outcome.
         properties.setQueryTimeoutMs(4_000);
-        properties.setResultWaitMs(3_000);
+        properties.setResultWaitMs(2_000);
         properties.setBaseUrl(baseUrl("/staged-row"));
-        TrackingOutcome outcome = probe.query("MSDU7172233");
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
+    }
 
-        assertThat(outcome).isInstanceOf(TrackingOutcome.Success.class);
-        assertThat(((TrackingOutcome.Success) outcome).parsed().rawStatus())
-                .contains("Loaded on vessel")
-                .doesNotContain("picked up");
+    @Test
+    void doesNotPublishTheOldStatusWhenTheStagedRenderRewritesARowFirst() {
+        // The seventh-review repro: rewrite an existing row, then change the
+        // status 900 ms later. A stamped block is never adopted, so the probe
+        // must time out rather than report the old "Container picked up".
+        properties.setQueryTimeoutMs(4_000);
+        properties.setResultWaitMs(2_500);
+        properties.setBaseUrl(baseUrl("/staged-edit"));
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
     }
 
     @Test
@@ -678,6 +722,7 @@ class MscProbeBrowserTest {
             case "/track-200-before-render" -> respond(exchange, 200, TRACK_200_BEFORE_RENDER);
             case "/real-render-same-status" -> respond(exchange, 200, REAL_RENDER_SAME_STATUS);
             case "/staged-row" -> respond(exchange, 200, STAGED_RENDER_DROPS_ROW_FIRST);
+            case "/staged-edit" -> respond(exchange, 200, STAGED_RENDER_EDITS_ROW_FIRST);
             case "/staged-reveal" -> respond(exchange, 200, STAGED_REVEAL_SECOND_BLOCK);
             case "/beacon" -> respond(exchange, 200, "{\"ok\":true}");
             case "/track-200" -> respond(exchange, 200, "{\"ok\":true}");

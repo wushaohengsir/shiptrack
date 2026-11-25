@@ -139,6 +139,103 @@ class MscLiveFixtureTest {
         assertThat(parsed.etas()).isEmpty();
     }
 
+    /**
+     * The seventh-review ETA repro: the summary names Vancouver as the POD but
+     * the only arrival in the timeline is at Seattle. The explicit POD must win
+     * and Seattle's date must never become the POD arrival.
+     */
+    @Test
+    void explicitPodWinsOverAnotherPortsArrivalInTheTimeline() {
+        Map<String, String> summary = new LinkedHashMap<>();
+        summary.put("Container", CONTAINER);
+        summary.put("Latest move", "BUSAN, KR");
+        summary.put("POD", "Vancouver, CA");
+        List<List<String>> rows = List.of(
+                List.of("05/12/2026", "Seattle, US", "Estimated Time of Arrival",
+                        "CAPE SOUNIO UK647R", "Terminal 5"),
+                List.of("21/11/2026", "Busan, KR", "Full Transshipment Loaded",
+                        "CAPE SOUNIO UK643A", "Hmm psa new-port terminal (hpnt)"));
+
+        ParsedTracking parsed = parser.parse(cardSnapshot(summary, rows), CONTAINER);
+
+        assertThat(parsed.pod()).isEqualTo("Vancouver, CA");
+        // Only Seattle has an arrival and it is not the POD: 2026-12-05 must
+        // not appear, and no POD ETA is produced at all.
+        assertThat(parsed.etas()).isEmpty();
+    }
+
+    /** A day-first dd/MM/yyyy POD ETA is 7 December, never 12 July. */
+    @Test
+    void readsTheDayFirstPodEtaFromTheSummary() {
+        Map<String, String> summary = new LinkedHashMap<>();
+        summary.put("Container", CONTAINER);
+        summary.put("Latest move", "BUSAN, KR");
+        summary.put("POD", "Vancouver, CA");
+        summary.put("POD ETA", "07/12/2026");
+        List<List<String>> rows = List.of(
+                List.of("07/12/2026", "Vancouver, CA", "Estimated Time of Arrival",
+                        "CAPE SOUNIO UK647R", "Deltaport"),
+                List.of("21/11/2026", "Busan, KR", "Full Transshipment Loaded",
+                        "CAPE SOUNIO UK643A", "Hmm psa new-port terminal (hpnt)"));
+
+        ParsedTracking parsed = parser.parse(cardSnapshot(summary, rows), CONTAINER);
+
+        assertThat(parsed.pod()).isEqualTo("Vancouver, CA");
+        assertThat(parsed.etas()).singleElement().satisfies(eta -> {
+            assertThat(eta.milestone()).isEqualTo(TrackedMilestone.POD_ARRIVAL);
+            assertThat(eta.date()).isEqualTo(LocalDate.of(2026, 12, 7));
+        });
+    }
+
+    /** A cancelled arrival stays in the timeline and is never a POD ETA. */
+    @Test
+    void aCancelledArrivalIsNeverThePodEta() {
+        Map<String, String> summary = new LinkedHashMap<>();
+        summary.put("Container", CONTAINER);
+        summary.put("Latest move", "VANCOUVER, CA");
+        summary.put("POD", "Vancouver, CA");
+        List<List<String>> rows = List.of(
+                List.of("06/12/2026", "Vancouver, CA", "Estimated Time of Arrival cancelled",
+                        "CAPE SOUNIO UK647R", "Deltaport"));
+
+        ParsedTracking parsed = parser.parse(cardSnapshot(summary, rows), CONTAINER);
+
+        assertThat(parsed.etas()).isEmpty();
+    }
+
+    /** An actual arrival is a fact and must not be republished as an ETA. */
+    @Test
+    void anActualArrivalIsNeverThePodEta() {
+        Map<String, String> summary = new LinkedHashMap<>();
+        summary.put("Container", CONTAINER);
+        summary.put("Latest move", "VANCOUVER, CA");
+        summary.put("POD", "Vancouver, CA");
+        List<List<String>> rows = List.of(
+                List.of("21/11/2026", "Vancouver, CA", "Actual Arrival",
+                        "CAPE SOUNIO UK647R", "Deltaport"));
+
+        ParsedTracking parsed = parser.parse(cardSnapshot(summary, rows), CONTAINER);
+
+        assertThat(parsed.etas()).isEmpty();
+    }
+
+    private static MscPageSnapshot cardSnapshot(Map<String, String> summary,
+                                                List<List<String>> rows) {
+        StringBuilder block = new StringBuilder("Container ").append(CONTAINER);
+        String latestMove = summary.get("Latest move");
+        if (latestMove != null) {
+            block.append('\n').append("Latest move ").append(latestMove);
+        }
+        String podEta = summary.get("POD ETA");
+        if (podEta != null) {
+            block.append('\n').append("POD ETA ").append(podEta);
+        }
+        return new MscPageSnapshot(
+                "MSC Tracking", "https://www.msc.com/en/track-a-shipment",
+                block.toString(), null, List.of(), false,
+                block.toString(), false, summary, rows);
+    }
+
     private static MscPageSnapshot fixtureSnapshot() throws IOException {
         String html;
         try (InputStream in = MscLiveFixtureTest.class.getClassLoader().getResourceAsStream(FIXTURE)) {

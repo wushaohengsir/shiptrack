@@ -84,6 +84,12 @@ public class MscProperties {
     private String loginFieldSelector = "input[type='password']";
 
     private int resultWaitMs = 30_000;
+    /**
+     * How long the result content must stay unchanged before it is accepted.
+     * A page that is still staging its render (dropping rows, rewriting
+     * labels) cannot pass this window.
+     */
+    private int resultSettleMs = 500;
     /** Hard per-query budget; §3.2 requires 30 s and the cap below enforces it. */
     private int queryTimeoutMs = 30_000;
     /** Time allowed for the tracking form to appear before it is a parse error. */
@@ -223,6 +229,14 @@ public class MscProperties {
 
     public void setResultWaitMs(int resultWaitMs) {
         this.resultWaitMs = resultWaitMs;
+    }
+
+    public int getResultSettleMs() {
+        return Math.max(0, Math.min(5_000, resultSettleMs));
+    }
+
+    public void setResultSettleMs(int resultSettleMs) {
+        this.resultSettleMs = resultSettleMs;
     }
 
     public int getQueryTimeoutMs() {

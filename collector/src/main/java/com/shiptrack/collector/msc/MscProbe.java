@@ -67,9 +67,10 @@ public class MscProbe implements MscTrackingClient {
     private static final long START_TIME_SKEW_MS = 200;
 
     /**
-     * Marks the result block and its status/timeline nodes before submission so
-     * a later read can prove the block was re-rendered. A page that only
-     * re-writes a clock label leaves the marks in place.
+     * Marks the result content (status, summary cells, timeline rows) before
+     * submission so a later read can prove the query rebuilt it. A page that
+     * only rewrites a label, drops a row or reveals a sibling leaves the marks
+     * in place and can never be adopted.
      */
     private static final String PROBE_ATTRIBUTE = "data-shiptrack-probe";
 
@@ -426,12 +427,20 @@ public class MscProbe implements MscTrackingClient {
             if (response != null && response.status() >= 400) {
                 return new WaitOutcome(WaitResult.HTTP_ERROR, null);
             }
-            // A visible block only counts when it names the queried container
-            // and this query actually re-rendered it. A 2xx from anywhere, a
-            // clock label ticking, a row disappearing or the pre-submit block
-            // left in place is not a render and must keep waiting.
-            if (render != null && !render.ambiguous() && renderFresh(beforeSubmit, render)) {
-                return new WaitOutcome(WaitResult.RESULT, render);
+            // All three must hold: the tracking call succeeded, the visible
+            // block carries no pre-submit stamp (this query rebuilt the
+            // result), and its facts stay identical over the settle window.
+            // A block that still carries a stamp is never adopted, even after
+            // it drops a row, rewrites a label or replaces another pre-existing
+            // block, so a staged page cannot publish its old status.
+            if (render != null && !render.ambiguous()
+                    && renderFresh(beforeSubmit, render)
+                    && trackingSucceeded(response)) {
+                ResultObservation settled = confirmSettled(
+                        page, containerNo, resultDeadline, beforeSubmit, render);
+                if (settled != null) {
+                    return new WaitOutcome(WaitResult.RESULT, settled);
+                }
             }
             if (errorClassifier.classify(capture(page, containerNo, deadline, true)).isPresent()) {
                 return new WaitOutcome(WaitResult.SIGNAL, render);
@@ -445,63 +454,53 @@ public class MscProbe implements MscTrackingClient {
     }
 
     /**
-     * A render is fresh only when this query actually produced it.
-     *
-     * <ul>
-     *   <li>The visible block still carries a pre-submit stamp: only a
-     *       substantive status/summary/timeline change counts. Removing an old
-     *       row, revealing a hidden block or re-timing a label never does, so
-     *       a staged page cannot publish its old "picked up" status.</li>
-     *   <li>The block carries no pre-submit stamp: the page rebuilt the result
-     *       region. The parser re-validates container, status and rows in the
-     *       same read.</li>
-     * </ul>
+     * The single freshness invariant: the visible block must carry none of the
+     * stamps this attempt put on the pre-submit blocks. A surviving stamp
+     * proves the block is the pre-submit one, no matter how its text changed.
+     * When the landing page showed no block for this container there is
+     * nothing to compare with, so the block is new.
      */
     private static boolean renderFresh(ResultBaseline before, ResultObservation now) {
-        if (before == null || before.blocks().isEmpty()) {
-            // Nothing showed this container before the click, so the block is
-            // new. The parser still validates its container, status and rows.
-            return true;
-        }
-        String marker = now.marker();
-        if (marker == null) {
-            // The stamped block is gone: the query replaced the result region.
-            return true;
-        }
-        BlockBaseline baseline = before.forMarker(marker);
-        if (baseline == null) {
-            return false;
-        }
-        // The block root survived but every stamped child is gone: the page
-        // rebuilt the block's content. A staged render only removes one row or
-        // reveals a sibling, so it still carries several stamps and never
-        // reaches this branch.
-        if (baseline.marked() > 1 && now.markedCount() == 1) {
-            return true;
-        }
-        return substantiveChange(baseline.facts(), now.facts());
+        return now.marker() == null;
+    }
+
+    /** Only a correlated tracking call that answered 2xx may yield a result. */
+    private static boolean trackingSucceeded(SubmitResponse response) {
+        return response != null && response.correlated()
+                && response.status() >= 200 && response.status() < 300;
     }
 
     /**
-     * A change that proves the query re-rendered the result instead of merely
-     * editing the old one. A timeline that only loses a row is a staged render
-     * (the page clears the old row before it publishes the new status), so it
-     * is deliberately not treated as freshness.
+     * Re-reads the freshly built block after the settle window. Adoption
+     * requires that the second read is still marker-free and shows the same
+     * facts; anything else is a render still in progress and is not published.
      */
-    private static boolean substantiveChange(ResultFacts before, ResultFacts now) {
-        if (!normalizeText(before.status()).equals(normalizeText(now.status()))) {
-            return true;
+    private ResultObservation confirmSettled(Page page, String containerNo, long deadline,
+                                             ResultBaseline before,
+                                             ResultObservation first) {
+        long settleMs = properties.getResultSettleMs();
+        if (settleMs <= 0) {
+            return first;
         }
-        if (!normalizedMap(before.summary()).equals(normalizedMap(now.summary()))) {
-            return true;
+        if (remainingMsOrZero(deadline) < settleMs) {
+            // Not enough budget left to prove stability.
+            return null;
         }
-        List<List<String>> oldRows = normalizedRows(before.eventRows());
-        List<List<String>> newRows = normalizedRows(now.eventRows());
-        if (oldRows.equals(newRows)) {
-            return false;
+        sleep(settleMs);
+        if (remainingMsOrZero(deadline) <= 0) {
+            return null;
         }
-        // Rows may only be added or changed; a pure deletion is not a render.
-        return newRows.size() >= oldRows.size();
+        ResultObservation second = observeResult(page, containerNo, deadline, before);
+        if (second == null || second.ambiguous() || second.marker() != null) {
+            return null;
+        }
+        return sameFacts(first.facts(), second.facts()) ? second : null;
+    }
+
+    private static boolean sameFacts(ResultFacts first, ResultFacts second) {
+        return normalizeText(first.status()).equals(normalizeText(second.status()))
+                && normalizedMap(first.summary()).equals(normalizedMap(second.summary()))
+                && normalizedRows(first.eventRows()).equals(normalizedRows(second.eventRows()));
     }
 
     private static Map<String, String> normalizedMap(Map<String, String> values) {
@@ -1043,16 +1042,17 @@ public class MscProbe implements MscTrackingClient {
         ResultFacts facts = factsOf(block, deadline, true);
         boolean ambiguous = facts.ambiguous() || blocks.size() > 1;
         String marker = before == null ? null : markerOn(block, before);
-        int markedCount = marker == null ? 0 : countMarked(block, marker);
-        return new ResultObservation(blockText, facts, ambiguous, marker, markedCount);
+        return new ResultObservation(blockText, facts, ambiguous, marker);
     }
 
     /**
      * Records every block that already exists for this container before the
-     * click and stamps each one with its own marker. A later read proves
-     * freshness by that block's stamp disappearing (a rebuild) or by its
-     * visible facts substantively changing. Marking all candidates means a
-     * second pre-existing block that is merely revealed cannot pass as new.
+     * click and stamps its content with a unique marker. A later read proves
+     * freshness by that stamp being gone: the query rebuilt the content. The
+     * block root is stamped only when it has no stampable content, so a page
+     * that replaces the children of a stable container still counts as a
+     * rebuild. Marking hidden candidates means a second pre-existing block
+     * that is merely revealed cannot pass as new.
      */
     private ResultBaseline recordResultBaseline(Page page, String containerNo, long deadline) {
         List<Locator> blocks = resultBlocksFor(page, containerNo, true, deadline);
@@ -1062,13 +1062,18 @@ public class MscProbe implements MscTrackingClient {
         List<BlockBaseline> baselines = new ArrayList<>(blocks.size());
         for (Locator block : blocks) {
             String marker = "m" + UUID.randomUUID().toString().replace("-", "");
-            int marked = mark(block, marker);
+            int marked = markContent(block, marker);
+            if (marked == 0 && markNode(block, marker)) {
+                // No status/summary/event node could be stamped; fall back to
+                // the root. Such a block only counts as fresh when the whole
+                // root is replaced, which is the conservative reading.
+                marked = 1;
+            }
             if (marked == 0) {
-                // Could not stamp this candidate; it cannot be proven fresh
-                // later, so record no baseline for it.
+                // Could not stamp this candidate at all.
                 continue;
             }
-            baselines.add(new BlockBaseline(marker, marked, factsOf(block, deadline, false)));
+            baselines.add(new BlockBaseline(marker));
         }
         return baselines.isEmpty() ? null : new ResultBaseline(List.copyOf(baselines));
     }
@@ -1083,12 +1088,9 @@ public class MscProbe implements MscTrackingClient {
         return null;
     }
 
-    /** Stamps the block and its status/timeline nodes; returns how many took it. */
-    private int mark(Locator block, String marker) {
+    /** Stamps the block's status/summary/timeline nodes; returns how many took it. */
+    private int markContent(Locator block, String marker) {
         int marked = 0;
-        if (markNode(block, marker)) {
-            marked++;
-        }
         for (Locator node : nodes(block, properties.getStatusSelector(), false)) {
             if (markNode(node, marker)) {
                 marked++;
@@ -1211,23 +1213,12 @@ public class MscProbe implements MscTrackingClient {
     record SubmitResponse(int status, String retryAfterSeconds, boolean correlated) {
     }
 
-    /**
-     * All pre-submit candidate blocks for this container, each with its own
-     * stamp and facts.
-     */
+    /** All pre-submit candidate blocks for this container, each with its stamp. */
     private record ResultBaseline(List<BlockBaseline> blocks) {
-        BlockBaseline forMarker(String marker) {
-            for (BlockBaseline block : blocks) {
-                if (block.marker().equals(marker)) {
-                    return block;
-                }
-            }
-            return null;
-        }
     }
 
-    /** One pre-submit block: its stamp, how many nodes took it, and its facts. */
-    private record BlockBaseline(String marker, int marked, ResultFacts facts) {
+    /** One pre-submit block and the stamp its content carries. */
+    private record BlockBaseline(String marker) {
     }
 
     /**
@@ -1237,7 +1228,7 @@ public class MscProbe implements MscTrackingClient {
      * when the page rebuilt it.
      */
     private record ResultObservation(String blockText, ResultFacts facts,
-                                     boolean ambiguous, String marker, int markedCount) {
+                                     boolean ambiguous, String marker) {
     }
 
     /** The terminal state of the wait plus the read that satisfied it. */
