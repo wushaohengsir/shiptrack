@@ -6,6 +6,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.PreparedStatement;
 import java.sql.Statement;
@@ -107,7 +108,14 @@ public class NotificationRepository {
      * compared as a string in the write-backs: a JDBC {@link java.sql.Timestamp}
      * parameter would be converted through the driver's connection time zone,
      * which masks the exact column value on every deployment but one.</p>
+     *
+     * <p>The conditional update and the identifier read share one transaction,
+     * so the row lock is held until commit: no other dispatcher (or recovery
+     * task) can replace this attempt's {@code sending_at} between the flip and
+     * the read. A recovery task that takes over afterwards writes a new token,
+     * and the late response is discarded by the conditional write-backs.</p>
      */
+    @Transactional
     public Optional<Claimed> claim(long id) {
         int updated = jdbc.update("""
                 UPDATE notifications
@@ -154,15 +162,6 @@ public class NotificationRepository {
                     next_retry_at = DATE_ADD(NOW(3), INTERVAL ? MICROSECOND)
                 WHERE id = ? AND status = 'sending' AND sending_at = CAST(? AS DATETIME(3))
                 """, truncate(error), responseCode, retryBackoffMicros, id, attemptToken);
-    }
-
-    /** Returns a claimed row to {@code pending} when the sender cannot run (e.g. no webhook). */
-    public int releaseToPending(long id, String attemptToken) {
-        return jdbc.update("""
-                UPDATE notifications
-                SET status = 'pending', sending_at = NULL
-                WHERE id = ? AND status = 'sending' AND sending_at = CAST(? AS DATETIME(3))
-                """, id, attemptToken);
     }
 
     public List<Claimed> findStuckSending(long timeoutMicros) {

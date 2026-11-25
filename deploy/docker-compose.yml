@@ -95,6 +95,10 @@ services:
       STATUS_MAPPING_PATH: /app/config/status-mappings.yaml
       SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-false}
       TASK_CLAIM_TIMEOUT_MS: ${TASK_CLAIM_TIMEOUT_MS:-900000}
+      # §7.5 delivery credentials are injected from deploy/.env and never
+      # committed. An empty URL makes dispatch fail the queue instead of spinning.
+      FEISHU_WEBHOOK_URL: ${FEISHU_WEBHOOK_URL:-}
+      FEISHU_WEBHOOK_SECRET: ${FEISHU_WEBHOOK_SECRET:-}
       JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:--Xms256m -Xmx512m}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:

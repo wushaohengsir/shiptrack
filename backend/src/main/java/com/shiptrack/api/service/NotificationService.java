@@ -12,6 +12,7 @@ import com.shiptrack.contract.enums.ErrorCode;
 import com.shiptrack.contract.enums.NotificationChannel;
 import com.shiptrack.contract.enums.NotificationStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
@@ -51,7 +52,15 @@ public class NotificationService {
         return toDto(require(id));
     }
 
-    /** §5.14: only {@code failed} can be resent; {@code sending} cannot. */
+    /**
+     * §5.14: only {@code failed} can be resent; {@code sending} cannot.
+     *
+     * <p>The conditional update and the read that builds the 202 response share
+     * one transaction, so the response always describes this resend's
+     * {@code pending} row. A dispatcher cannot claim the row until commit, and
+     * a concurrent retry loses the conditional update.</p>
+     */
+    @Transactional
     public NotificationRetryResponse retry(long id) {
         NotificationRecord current = require(id);
         int updated = notifications.retryFailed(id);

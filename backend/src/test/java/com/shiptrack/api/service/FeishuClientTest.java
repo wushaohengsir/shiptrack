@@ -45,20 +45,22 @@ class FeishuClientTest {
                     StandardCharsets.UTF_8));
             String mode = MODE.get();
             if ("slow".equals(mode)) {
-                try {
-                    Thread.sleep(500);
-                } catch (InterruptedException error) {
-                    Thread.currentThread().interrupt();
-                }
+                sleep(500);
             }
             int status = 200;
             String body = "{\"code\":0,\"msg\":\"success\"}";
             switch (mode) {
-                case "code" -> body = "{\"code\":19001,\"msg\":\"param error\"}";
+                case "code" -> body = "{\"code\":19001,\"msg\":\"upstream-diagnostic-xyz\"}";
                 case "http500" -> {
                     status = 500;
-                    body = "{\"code\":-1,\"msg\":\"stub failure\"}";
+                    body = "{\"code\":-1,\"msg\":\"upstream-diagnostic-xyz\"}";
                 }
+                case "codeNull" -> body = "{\"code\":null,\"msg\":\"upstream-diagnostic-xyz\"}";
+                case "codeEmpty" -> body = "{\"code\":\"\",\"msg\":\"upstream-diagnostic-xyz\"}";
+                case "codeString" -> body = "{\"code\":\"0\",\"msg\":\"upstream-diagnostic-xyz\"}";
+                case "statusCode" -> body = "{\"StatusCode\":0,\"msg\":\"upstream-diagnostic-xyz\"}";
+                case "codeHuge" -> body = "{\"code\":4294967296,\"msg\":\"upstream-diagnostic-xyz\"}";
+                case "codeDecimalZero" -> body = "{\"code\":0.0,\"msg\":\"success\"}";
                 case "plain" -> body = "not-json";
                 default -> {
                 }
@@ -66,7 +68,15 @@ class FeishuClientTest {
             byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().add("Content-Type", "application/json");
             exchange.sendResponseHeaders(status, bytes.length);
-            exchange.getResponseBody().write(bytes);
+            if ("slowBody".equals(mode)) {
+                // The headers are already on the wire; the body stalls past the deadline.
+                sleep(500);
+            }
+            try {
+                exchange.getResponseBody().write(bytes);
+            } catch (IOException ignored) {
+                // The client cancelled after the total deadline expired.
+            }
             exchange.close();
         });
         server.setExecutor(Executors.newCachedThreadPool());
@@ -78,6 +88,14 @@ class FeishuClientTest {
     static void stopStub() {
         if (server != null) {
             server.stop(0);
+        }
+    }
+
+    private static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -152,7 +170,70 @@ class FeishuClientTest {
 
         assertFalse(result.success());
         assertEquals(200, result.responseCode());
-        assertTrue(result.error().contains("缺少 code"));
+        assertTrue(result.error().contains("响应缺少数值型 code"));
+    }
+
+    @Test
+    void codeMustBeAJsonNumberEqualToZero() {
+        for (String mode : List.of("codeNull", "codeEmpty", "codeString", "statusCode")) {
+            BODIES.clear();
+            MODE.set(mode);
+            FeishuClient.FeishuSendResult result =
+                    new FeishuClient(properties(2000, "")).sendFirst(List.of("x"));
+
+            assertFalse(result.success(), mode + " must not be treated as success");
+            assertEquals(200, result.responseCode(), mode);
+            assertTrue(result.error().contains("响应缺少数值型 code"), mode + ": " + result.error());
+        }
+    }
+
+    @Test
+    void aHugeNonZeroCodeNeverWrapsIntoZero() {
+        BODIES.clear();
+        MODE.set("codeHuge");
+        FeishuClient.FeishuSendResult result =
+                new FeishuClient(properties(2000, "")).sendFirst(List.of("x"));
+
+        assertFalse(result.success(), "4294967296 must not wrap into 0");
+        assertTrue(result.error().contains("4294967296"), result.error());
+        assertEquals(200, result.responseCode());
+    }
+
+    @Test
+    void aNumericDecimalZeroIsStillSuccess() {
+        BODIES.clear();
+        MODE.set("codeDecimalZero");
+        FeishuClient.FeishuSendResult result =
+                new FeishuClient(properties(2000, "")).sendFirst(List.of("x"));
+
+        assertTrue(result.success());
+        assertEquals(0, result.responseCode());
+    }
+
+    @Test
+    void upstreamMessageTextNeverLeaksIntoTheError() {
+        for (String mode : List.of("code", "http500", "codeNull", "codeEmpty", "codeString", "statusCode")) {
+            BODIES.clear();
+            MODE.set(mode);
+            FeishuClient.FeishuSendResult result =
+                    new FeishuClient(properties(2000, "")).sendFirst(List.of("x"));
+
+            assertNotNull(result.error(), mode);
+            assertFalse(result.error().contains("upstream-diagnostic-xyz"),
+                    mode + ": " + result.error());
+        }
+    }
+
+    @Test
+    void bodyReadPastTheTotalDeadlineIsAFailure() {
+        BODIES.clear();
+        MODE.set("slowBody");
+        FeishuClient.FeishuSendResult result =
+                new FeishuClient(properties(150, "")).sendFirst(List.of("x"));
+
+        assertFalse(result.success());
+        assertNull(result.responseCode());
+        assertEquals("请求超时", result.error());
     }
 
     @Test

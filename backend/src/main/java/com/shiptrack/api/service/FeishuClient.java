@@ -9,16 +9,20 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * The only place that talks to the Feishu custom-bot webhook (§7.5).
@@ -96,54 +100,76 @@ public class FeishuClient {
                 .header("Content-Type", "application/json; charset=utf-8")
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build();
+        // §7.5: the request timeout only covers the response head on some JDKs.
+        // A dedicated deadline around the whole future also bounds the body read,
+        // and an expired attempt is cancelled so it cannot keep a dispatcher busy.
+        CompletableFuture<HttpResponse<String>> future =
+                http.sendAsync(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         try {
-            HttpResponse<String> response = http.send(request,
-                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            HttpResponse<String> response = future.get(properties.getRequestTimeoutMs(),
+                    TimeUnit.MILLISECONDS);
             return interpret(response.statusCode(), response.body());
-        } catch (HttpTimeoutException error) {
+        } catch (TimeoutException error) {
+            future.cancel(true);
             return FeishuSendResult.failed(null, "请求超时");
-        } catch (IOException error) {
-            return FeishuSendResult.failed(null, "网络错误：" + error.getClass().getSimpleName());
+        } catch (ExecutionException error) {
+            future.cancel(true);
+            Throwable cause = error.getCause();
+            if (cause instanceof HttpTimeoutException) {
+                return FeishuSendResult.failed(null, "请求超时");
+            }
+            String type = cause == null ? "未知" : cause.getClass().getSimpleName();
+            return FeishuSendResult.failed(null, "网络错误：" + type);
         } catch (InterruptedException error) {
+            future.cancel(true);
             Thread.currentThread().interrupt();
             return FeishuSendResult.failed(null, "发送被中断");
         }
     }
 
+    /**
+     * §7.5 success rule: HTTP 2xx <b>and</b> a JSON numeric {@code code == 0}.
+     * Missing, null, blank, string-typed or {@code StatusCode}-only responses
+     * are failures. The upstream {@code msg} is deliberately ignored: error
+     * text is a fixed local description of the HTTP status and numeric code.
+     */
     private FeishuSendResult interpret(int httpStatus, String responseBody) {
-        Integer code = null;
-        String message = null;
-        String messageId = null;
+        boolean httpOk = httpStatus / 100 == 2;
+        JsonNode node = null;
         try {
-            JsonNode node = mapper.readTree(responseBody == null ? "" : responseBody);
-            if (node != null && !node.isMissingNode()) {
-                if (node.has("code")) {
-                    code = node.get("code").asInt();
-                } else if (node.has("StatusCode")) {
-                    code = node.get("StatusCode").asInt();
-                }
-                message = node.path("msg").asText(null);
-                messageId = node.path("data").path("message_id").asText(null);
-            }
+            node = mapper.readTree(responseBody == null ? "" : responseBody);
         } catch (JsonProcessingException ignored) {
             // A non-JSON body still fails below; the HTTP status is kept as the code.
         }
-        boolean ok = httpStatus / 100 == 2 && code != null && code == 0;
-        if (ok) {
-            return FeishuSendResult.ok(code, messageId);
+        JsonNode codeNode = node == null || node.isMissingNode() ? null : node.get("code");
+        boolean numeric = codeNode != null && codeNode.isNumber();
+        boolean zero = numeric && codeNode.decimalValue().compareTo(BigDecimal.ZERO) == 0;
+        String codeText = numeric ? codeNode.asText() : null;
+        String messageId = node == null ? null
+                : textOrNull(node.path("data").path("message_id"));
+
+        if (httpOk && zero) {
+            return FeishuSendResult.ok(0, messageId);
         }
-        Integer recorded = code != null ? code : httpStatus;
+
         StringBuilder error = new StringBuilder("HTTP ").append(httpStatus);
-        if (code != null) {
-            error.append(" code ").append(code);
+        if (codeText != null) {
+            error.append(" code ").append(codeText);
         }
-        if (message != null && !message.isBlank()) {
-            error.append(' ').append(message);
+        if (!httpOk) {
+            error.append("（非 2xx 响应）");
+        } else if (!numeric) {
+            error.append("（响应缺少数值型 code）");
+        } else {
+            error.append("（code 非 0）");
         }
-        if (code == null) {
-            error.append("（响应缺少 code）");
-        }
+        Integer recorded = numeric && codeNode.canConvertToInt()
+                ? codeNode.asInt() : httpStatus;
         return FeishuSendResult.failed(recorded, error.toString());
+    }
+
+    private static String textOrNull(JsonNode node) {
+        return node == null || node.isMissingNode() || node.isNull() ? null : node.asText(null);
     }
 
     /** Outcome of one delivery attempt. Never carries the URL or secret. */

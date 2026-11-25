@@ -2,10 +2,17 @@ package com.shiptrack.api;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.shiptrack.api.config.FeishuProperties;
 import com.shiptrack.api.repo.NotificationRecord;
 import com.shiptrack.api.repo.NotificationRepository;
+import com.shiptrack.api.service.AppConfigService;
+import com.shiptrack.api.service.FeishuClient;
 import com.shiptrack.api.service.FeishuSigner;
 import com.shiptrack.api.service.NotificationDispatchService;
+import com.shiptrack.api.service.NotificationService;
+import com.shiptrack.api.support.JsonStore;
+import com.shiptrack.contract.dto.NotificationRetryResponse;
+import com.shiptrack.contract.enums.NotificationStatus;
 import com.sun.net.httpserver.HttpServer;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeEach;
@@ -13,6 +20,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
@@ -24,12 +32,19 @@ import org.testcontainers.mysql.MySQLContainer;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -60,6 +75,21 @@ class NotificationIntegrationTest {
             .withDatabaseName("shiptrack")
             .withUsername("shiptrack")
             .withPassword("shiptrack-test");
+    /**
+     * The arrival rule is tested with ordinary status-change notifications
+     * switched off; the other notifications are unconditional by §10.3.
+     */
+    private static final Path CONFIG_FILE = writeConfig();
+
+    private static Path writeConfig() {
+        try {
+            Path path = Files.createTempFile("shiptrack-it-config", ".yaml");
+            Files.writeString(path, "notify_on_status_change: false\n");
+            return path;
+        } catch (IOException error) {
+            throw new ExceptionInInitializerError(error);
+        }
+    }
 
     private static HttpServer startStub() {
         try {
@@ -67,16 +97,24 @@ class NotificationIntegrationTest {
             server.createContext("/hook", exchange -> {
                 BODIES.add(new String(exchange.getRequestBody().readAllBytes(),
                         StandardCharsets.UTF_8));
+                String mode = MODE.get();
                 int status = 200;
                 String body = "{\"code\":0,\"msg\":\"success\"}";
-                if (!"ok".equals(MODE.get())) {
+                if (!"ok".equals(mode) && !"slowBody".equals(mode)) {
                     status = 500;
                     body = "{\"code\":19001,\"msg\":\"stub failure\"}";
                 }
                 byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
                 exchange.getResponseHeaders().add("Content-Type", "application/json");
                 exchange.sendResponseHeaders(status, bytes.length);
-                exchange.getResponseBody().write(bytes);
+                if ("slowBody".equals(mode)) {
+                    sleep(3000);
+                }
+                try {
+                    exchange.getResponseBody().write(bytes);
+                } catch (IOException ignored) {
+                    // The client cancelled after the total deadline expired.
+                }
                 exchange.close();
             });
             server.setExecutor(Executors.newCachedThreadPool());
@@ -84,6 +122,14 @@ class NotificationIntegrationTest {
             return server;
         } catch (IOException error) {
             throw new ExceptionInInitializerError(error);
+        }
+    }
+
+    private static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -103,7 +149,7 @@ class NotificationIntegrationTest {
         registry.add("app.access-token", () -> API_TOKEN);
         registry.add("app.internal-token", () -> INTERNAL_TOKEN);
         registry.add("app.scheduler-enabled", () -> "false");
-        registry.add("app.config-path", () -> "/nonexistent/config.yaml");
+        registry.add("app.config-path", () -> CONFIG_FILE.toString());
         registry.add("app.status-mapping-path", () -> "/nonexistent/status-mappings.yaml");
         registry.add("app.feishu.webhook-url",
                 () -> "http://127.0.0.1:" + FEISHU.getAddress().getPort() + "/hook");
@@ -127,6 +173,18 @@ class NotificationIntegrationTest {
 
     @Autowired
     private NotificationRepository notificationRepository;
+
+    @Autowired
+    private NotificationService notificationService;
+
+    @Autowired
+    private JsonStore jsonStore;
+
+    @Autowired
+    private AppConfigService appConfigService;
+
+    @Autowired
+    private JdbcTemplate jdbc;
 
     private MockMvc mvc;
 
@@ -189,7 +247,10 @@ class NotificationIntegrationTest {
         String timestamp = request.get("timestamp").asText();
         assertEquals(FeishuSigner.sign(timestamp, SECRET), request.get("sign").asText());
         String text = request.get("content").get("text").asText();
-        assertTrue(text.contains("• MSDU7172233"));
+        assertTrue(text.contains("【船期变化】PO-IT-NOTIFY"), text);
+        assertTrue(text.contains("• MSDU7172233  到港 2026-12-07 → 2026-12-09"
+                + "（较上次推迟 2 天；较基线累计推迟 2 天；当前风险 延误）"), text);
+        assertTrue(text.contains("航线：Ningbo, CN → Vancouver, CA"), text);
         assertTrue(text.contains("通知标识：" + key));
         assertTrue(text.contains("数据来源：MSC"));
         assertTrue(request.toString().getBytes(StandardCharsets.UTF_8).length
@@ -277,9 +338,245 @@ class NotificationIntegrationTest {
                 .andReturn().getResponse().getStatus());
     }
 
+    @Test
+    void bodyReadTimeoutFailsTheAttemptAndTheNextTickContinues() throws Exception {
+        BODIES.clear();
+        Map<String, Object> order = createOrder("PO-IT-SLOW-BODY");
+        long orderId = ((Number) order.get("id")).longValue();
+        long containerId = firstContainerId(order);
+        String run1 = refreshContainer(containerId);
+        report(run1, containerId, (String) claim(run1).get("claim_token"), "2026-12-07");
+        String run2 = refreshContainer(containerId);
+        Map<String, Object> reportBody = report(run2, containerId,
+                (String) claim(run2).get("claim_token"), "2026-12-09");
+        long notificationId = ((Number) ((Map<?, ?>) reportBody.get("order_notification"))
+                .get("notification_id")).longValue();
+        String key = "order:" + orderId + ":run:" + run2 + ":channel:feishu";
+
+        MODE.set("slowBody");
+        assertEquals(0, dispatcher.dispatchOnce());
+        NotificationRecord timedOut = notificationRepository.findById(notificationId).orElseThrow();
+        assertEquals("failed", timedOut.status().wireValue());
+        assertEquals("请求超时", timedOut.lastError());
+        assertNull(timedOut.feishuResponseCode());
+
+        MODE.set("ok");
+        sleep(80);
+        assertTrue(dispatcher.dispatchOnce() >= 1, "the next tick must still dispatch");
+        assertEquals("sent",
+                notificationRepository.findById(notificationId).orElseThrow().status().wireValue());
+    }
+
+    @Test
+    void arrivedPodNotifiesEvenWhenStatusChangeNotificationsAreOff() throws Exception {
+        BODIES.clear();
+        Map<String, Object> order = createOrder("PO-IT-ARRIVED");
+        long orderId = ((Number) order.get("id")).longValue();
+        long containerId = firstContainerId(order);
+
+        String run1 = refreshContainer(containerId);
+        report(run1, containerId, (String) claim(run1).get("claim_token"),
+                "2026-12-09", "DEPARTED");
+        String run2 = refreshContainer(containerId);
+        Map<String, Object> reportBody = report(run2, containerId,
+                (String) claim(run2).get("claim_token"), "2026-12-09", "ARRIVED_POD");
+        Map<?, ?> notification = (Map<?, ?>) reportBody.get("order_notification");
+        assertEquals("created", notification.get("state"),
+                "an ARRIVED_POD transition must notify regardless of the status switch");
+        String key = "order:" + orderId + ":run:" + run2 + ":channel:feishu";
+
+        assertTrue(dispatcher.dispatchOnce() >= 1);
+        String text = sentText(key);
+        assertTrue(text.contains("• MSDU7172233  已到港"), text);
+        assertTrue(text.contains("航线：Ningbo, CN → Vancouver, CA"), text);
+    }
+
+    @Test
+    void healthDowngradeNotifies() throws Exception {
+        BODIES.clear();
+        Map<String, Object> order = createOrder("PO-IT-HEALTH");
+        long orderId = ((Number) order.get("id")).longValue();
+        long containerId = firstContainerId(order);
+
+        String run1 = refreshContainer(containerId);
+        report(run1, containerId, (String) claim(run1).get("claim_token"), "2026-12-09");
+        String run2 = refreshContainer(containerId);
+        Map<String, Object> reportBody = reportFailure(run2, containerId,
+                (String) claim(run2).get("claim_token"));
+        Map<?, ?> notification = (Map<?, ?>) reportBody.get("order_notification");
+        assertEquals("created", notification.get("state"));
+        String key = "order:" + orderId + ":run:" + run2 + ":channel:feishu";
+
+        assertTrue(dispatcher.dispatchOnce() >= 1);
+        String text = sentText(key);
+        assertTrue(text.contains("• MSDU7172233  查询失败，数据可能过期"), text);
+    }
+
+    @Test
+    void missingConfigFailsTheQueueAndManualResendStillWorks() throws Exception {
+        Map<String, Object> order = createOrder("PO-IT-NO-WEBHOOK");
+        long orderId = ((Number) order.get("id")).longValue();
+        String key = "order:" + orderId + ":run:R-NO-WEBHOOK:channel:feishu";
+        long notificationId = notificationRepository.insertPendingIfAbsent(orderId, key,
+                "R-NO-WEBHOOK", payloadJson(key));
+
+        FeishuProperties empty = new FeishuProperties();
+        empty.setDispatchEnabled(true);
+        NotificationDispatchService withoutWebhook = new NotificationDispatchService(
+                empty, new FeishuClient(empty), notificationRepository, jsonStore,
+                appConfigService);
+
+        assertEquals(0, withoutWebhook.dispatchOnce());
+        NotificationRecord failed = notificationRepository.findById(notificationId).orElseThrow();
+        assertEquals("failed", failed.status().wireValue());
+        assertEquals(NotificationDispatchService.MISSING_CONFIG_ERROR, failed.lastError());
+        assertNull(failed.nextRetryAt(), "no automatic backoff while unconfigured");
+
+        MvcResult retried = mvc.perform(post("/api/v1/notifications/" + notificationId + "/retry")
+                        .header("Authorization", "Bearer " + API_TOKEN))
+                .andReturn();
+        assertEquals(202, retried.getResponse().getStatus(), bodyText(retried));
+        assertEquals("pending", body(retried).get("status"),
+                "§5.14 manual resend must still work");
+        jdbc.update("DELETE FROM notifications WHERE id = ?", notificationId);
+    }
+
+    @Test
+    void disabledDispatchLeavesTheQueuePending() throws Exception {
+        Map<String, Object> order = createOrder("PO-IT-DISABLED");
+        long orderId = ((Number) order.get("id")).longValue();
+        String key = "order:" + orderId + ":run:R-DISABLED:channel:feishu";
+        long notificationId = notificationRepository.insertPendingIfAbsent(orderId, key,
+                "R-DISABLED", payloadJson(key));
+
+        FeishuProperties disabled = new FeishuProperties();
+        disabled.setWebhookUrl("http://127.0.0.1:1/hook");
+        disabled.setDispatchEnabled(false);
+        NotificationDispatchService off = new NotificationDispatchService(
+                disabled, new FeishuClient(disabled), notificationRepository, jsonStore,
+                appConfigService);
+
+        assertEquals(0, off.dispatchOnce());
+        assertEquals("pending",
+                notificationRepository.findById(notificationId).orElseThrow().status().wireValue());
+        jdbc.update("DELETE FROM notifications WHERE id = ?", notificationId);
+    }
+
+    @Test
+    void rateLimitedAttemptIsFailedWithBackoffAndNoHttpCall() throws Exception {
+        Map<String, Object> order = createOrder("PO-IT-RATE");
+        long orderId = ((Number) order.get("id")).longValue();
+        String key = "order:" + orderId + ":run:R-RATE:channel:feishu";
+        long notificationId = notificationRepository.insertPendingIfAbsent(orderId, key,
+                "R-RATE", payloadJson(key));
+        int before = bodiesFor(key).size();
+
+        FeishuProperties limited = new FeishuProperties();
+        limited.setWebhookUrl("http://127.0.0.1:" + FEISHU.getAddress().getPort() + "/hook");
+        limited.setDispatchEnabled(true);
+        limited.setRatePerSecond(0);
+        limited.setRatePerMinute(100);
+        NotificationDispatchService limitedDispatcher = new NotificationDispatchService(
+                limited, new FeishuClient(limited), notificationRepository, jsonStore,
+                appConfigService);
+
+        assertEquals(0, limitedDispatcher.dispatchOnce());
+        NotificationRecord failed = notificationRepository.findById(notificationId).orElseThrow();
+        assertEquals("failed", failed.status().wireValue());
+        assertEquals(NotificationDispatchService.RATE_LIMITED_ERROR, failed.lastError());
+        assertNotNull(failed.nextRetryAt(), "the excess attempt enters the normal backoff");
+        assertEquals(before, bodiesFor(key).size(), "a rejected attempt must not call Feishu");
+        jdbc.update("DELETE FROM notifications WHERE id = ?", notificationId);
+    }
+
+    @Test
+    void concurrentClaimHasExactlyOneWinner() throws Exception {
+        Map<String, Object> order = createOrder("PO-IT-CLAIM");
+        long orderId = ((Number) order.get("id")).longValue();
+        String key = "order:" + orderId + ":run:R-CLAIM:channel:feishu";
+        long notificationId = notificationRepository.insertPendingIfAbsent(orderId, key,
+                "R-CLAIM", payloadJson(key));
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch start = new CountDownLatch(1);
+        try {
+            Future<Optional<NotificationRepository.Claimed>> first =
+                    pool.submit(() -> {
+                        start.await();
+                        return notificationRepository.claim(notificationId);
+                    });
+            Future<Optional<NotificationRepository.Claimed>> second =
+                    pool.submit(() -> {
+                        start.await();
+                        return notificationRepository.claim(notificationId);
+                    });
+            start.countDown();
+            int winners = (first.get(10, TimeUnit.SECONDS).isPresent() ? 1 : 0)
+                    + (second.get(10, TimeUnit.SECONDS).isPresent() ? 1 : 0);
+            assertEquals(1, winners, "only one claim may flip pending → sending");
+        } finally {
+            pool.shutdownNow();
+            jdbc.update("DELETE FROM notifications WHERE id = ?", notificationId);
+        }
+    }
+
+    @Test
+    void retryResponseAlwaysDescribesThePendingResendUnderConcurrentDispatch() throws Exception {
+        Map<String, Object> order = createOrder("PO-IT-RETRY-RACE");
+        long orderId = ((Number) order.get("id")).longValue();
+        String key = "order:" + orderId + ":run:R-RETRY-RACE:channel:feishu";
+        long notificationId = notificationRepository.insertPendingIfAbsent(orderId, key,
+                "R-RETRY-RACE", payloadJson(key));
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            for (int round = 0; round < 10; round++) {
+                jdbc.update("""
+                        UPDATE notifications
+                        SET status = 'failed', retry_count = 0, sending_at = NULL,
+                            next_retry_at = NULL, sent_at = NULL
+                        WHERE id = ?
+                        """, notificationId);
+                CountDownLatch start = new CountDownLatch(1);
+                Future<NotificationRetryResponse> retried = pool.submit(() -> {
+                    start.await();
+                    return notificationService.retry(notificationId);
+                });
+                Future<Integer> dispatched = pool.submit(() -> {
+                    start.await();
+                    return dispatcher.dispatchOnce();
+                });
+                start.countDown();
+                NotificationRetryResponse response = retried.get(10, TimeUnit.SECONDS);
+                dispatched.get(10, TimeUnit.SECONDS);
+                assertEquals(NotificationStatus.PENDING, response.status(),
+                        "202 must describe this resend, never a concurrent sending/sent");
+                assertEquals(1, response.retryCount());
+            }
+        } finally {
+            pool.shutdownNow();
+            jdbc.update("DELETE FROM notifications WHERE id = ?", notificationId);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
+
+    private String sentText(String notificationKey) throws Exception {
+        List<String> sent = bodiesFor(notificationKey);
+        assertFalse(sent.isEmpty(), "expected a delivered message for " + notificationKey);
+        return JSON.readTree(sent.get(sent.size() - 1)).get("content").get("text").asText();
+    }
+
+    private String payloadJson(String key) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("title", "【船期变化】PO-IT");
+        payload.put("lines", List.of("MSDU7172233  到港 2026-12-07 → 2026-12-09"));
+        payload.put("queried_at", "2026-11-22T08:00:00Z");
+        payload.put("source", "MSC");
+        return jsonStore.write(payload);
+    }
 
     private List<String> bodiesFor(String notificationKey) throws Exception {
         List<String> matches = new ArrayList<>();
@@ -334,6 +631,11 @@ class NotificationIntegrationTest {
 
     private Map<String, Object> report(String runId, long containerId, String token,
                                        String etaDate) throws Exception {
+        return report(runId, containerId, token, etaDate, "DEPARTED");
+    }
+
+    private Map<String, Object> report(String runId, long containerId, String token,
+                                       String etaDate, String transportStatus) throws Exception {
         Map<String, Object> eta = new LinkedHashMap<>();
         eta.put("milestone", "POD_ARRIVAL");
         eta.put("raw_value", etaDate);
@@ -363,7 +665,7 @@ class NotificationIntegrationTest {
         payload.put("queried_at", "2026-11-22T08:00:35+08:00");
         payload.put("success", true);
         payload.put("raw_status", "Loaded on vessel CAPE SOUNIO/UK647R at Ningbo");
-        payload.put("transport_status", "DEPARTED");
+        payload.put("transport_status", transportStatus);
         payload.put("etas", List.of(eta));
         payload.put("source_events", List.of(event));
         payload.put("location", "Busan, KR");
@@ -372,6 +674,31 @@ class NotificationIntegrationTest {
         payload.put("pol", "Ningbo, CN");
         payload.put("pod", "Vancouver, CA");
         payload.put("final_destination", "Toronto, CA");
+        payload.put("source", "msc_web");
+
+        MvcResult result = mvc.perform(post("/internal/tracking-results")
+                        .header("X-Internal-Token", INTERNAL_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json(payload)))
+                .andReturn();
+        assertEquals(200, result.getResponse().getStatus(), bodyText(result));
+        return body(result);
+    }
+
+    private Map<String, Object> reportFailure(String runId, long containerId, String token)
+            throws Exception {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("run_id", runId);
+        payload.put("container_id", containerId);
+        payload.put("container_no", "MSDU7172233");
+        payload.put("carrier", "MSC");
+        payload.put("claim_token", token);
+        payload.put("retry_count", 0);
+        payload.put("mapping_version", 3);
+        payload.put("queried_at", "2026-11-22T08:00:35+08:00");
+        payload.put("success", false);
+        payload.put("error_code", "TIMEOUT");
+        payload.put("error_message", "carrier page timed out");
         payload.put("source", "msc_web");
 
         MvcResult result = mvc.perform(post("/internal/tracking-results")
