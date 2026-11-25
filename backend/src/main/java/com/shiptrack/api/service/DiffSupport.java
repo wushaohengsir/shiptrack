@@ -173,6 +173,7 @@ public final class DiffSupport {
         value.put("time", eta.time() == null ? null : eta.time().toString());
         value.put("precision", eta.precision());
         value.put("timezone", eta.timezone());
+        value.put("utc_at", eta.utcAt() == null ? null : eta.utcAt().toString());
         return value;
     }
 
