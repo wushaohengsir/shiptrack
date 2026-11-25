@@ -1,8 +1,10 @@
 package com.shiptrack.api.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.shiptrack.api.config.FeishuProperties;
 import org.slf4j.Logger;
@@ -39,7 +41,16 @@ public class FeishuClient {
     private static final Logger log = LoggerFactory.getLogger(FeishuClient.class);
 
     private final FeishuProperties properties;
-    private final ObjectMapper mapper = new ObjectMapper();
+    /**
+     * Strict parsing for the response body: exact decimals (a value like
+     * {@code 1e-400} must stay non-zero instead of underflowing to 0.0) and no
+     * trailing content after the JSON document ({@code {"code":0}garbage} is
+     * not a success).
+     */
+    private final ObjectMapper mapper = new ObjectMapper()
+            .setNodeFactory(JsonNodeFactory.withExactBigDecimals(true))
+            .configure(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS, true)
+            .configure(DeserializationFeature.FAIL_ON_TRAILING_TOKENS, true);
     private final HttpClient http;
 
     public FeishuClient(FeishuProperties properties) {
@@ -130,8 +141,10 @@ public class FeishuClient {
     /**
      * §7.5 success rule: HTTP 2xx <b>and</b> a JSON numeric {@code code == 0}.
      * Missing, null, blank, string-typed or {@code StatusCode}-only responses
-     * are failures. The upstream {@code msg} is deliberately ignored: error
-     * text is a fixed local description of the HTTP status and numeric code.
+     * are failures, as are bodies with trailing content after the JSON document
+     * and decimals that are not exactly zero. The upstream {@code msg} is
+     * deliberately ignored: error text is a fixed local description of the HTTP
+     * status and numeric code.
      */
     private FeishuSendResult interpret(int httpStatus, String responseBody) {
         boolean httpOk = httpStatus / 100 == 2;
@@ -163,9 +176,24 @@ public class FeishuClient {
         } else {
             error.append("（code 非 0）");
         }
-        Integer recorded = numeric && codeNode.canConvertToInt()
-                ? codeNode.asInt() : httpStatus;
-        return FeishuSendResult.failed(recorded, error.toString());
+        return FeishuSendResult.failed(recordedCode(httpStatus, numeric, codeNode),
+                error.toString());
+    }
+
+    /**
+     * Records the exact code only when it is an integer that fits an int; a
+     * fractional or out-of-range code keeps the HTTP status instead of being
+     * silently truncated (e.g. {@code 1e-400} must not be stored as 0).
+     */
+    private static Integer recordedCode(int httpStatus, boolean numeric, JsonNode codeNode) {
+        if (!numeric) {
+            return httpStatus;
+        }
+        try {
+            return codeNode.decimalValue().intValueExact();
+        } catch (ArithmeticException error) {
+            return httpStatus;
+        }
     }
 
     private static String textOrNull(JsonNode node) {

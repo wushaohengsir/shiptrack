@@ -51,12 +51,26 @@ public final class FeishuMessageBuilder {
             return new ArrayList<>(unique);
         }
 
+        // Step ①/② of §4.4: the full body keeps every field at full precision;
+        // only the metadata is dropped next. Dates are compressed in step ③.
         String allLines = bullets(groupsInOrder(boxOrder, groups));
         unique.add(title + "\n" + allLines + "\n" + metadata(payload, notificationKey, zone));
         unique.add(title + "\n" + allLines + "\n" + notification);
+
+        // Step ③: count + largest prefix of container groups, still full precision.
         for (int keep = containers - 1; keep >= 1; keep--) {
             unique.add(title + "\n共 " + containers + " 个箱号\n"
                     + bullets(groupsInOrder(boxOrder.subList(0, keep), groups)) + "\n"
+                    + notification);
+        }
+
+        // Step ④: only now compress ETA datetimes to YYYY-MM-DD, again with the
+        // largest prefix that fits. The full prefix is included so a single
+        // container still gets a compressed candidate.
+        Map<String, List<String>> compressed = compressDates(groups);
+        for (int keep = containers; keep >= 1; keep--) {
+            unique.add(title + "\n共 " + containers + " 个箱号\n"
+                    + bullets(groupsInOrder(boxOrder.subList(0, keep), compressed)) + "\n"
                     + notification);
         }
         unique.add(title + "\n共 " + containers + " 个箱号\n" + notification);
@@ -71,10 +85,22 @@ public final class FeishuMessageBuilder {
     private static Map<String, List<String>> groups(List<String> lines) {
         Map<String, List<String>> groups = new LinkedHashMap<>();
         for (String line : lines) {
-            String compact = normalizeEta(line);
-            groups.computeIfAbsent(containerOf(compact), key -> new ArrayList<>()).add(compact);
+            groups.computeIfAbsent(containerOf(line), key -> new ArrayList<>()).add(line);
         }
         return groups;
+    }
+
+    /** §7.5 step ③: the same groups with ETA datetimes reduced to their date. */
+    private static Map<String, List<String>> compressDates(Map<String, List<String>> groups) {
+        Map<String, List<String>> compressed = new LinkedHashMap<>();
+        for (Map.Entry<String, List<String>> entry : groups.entrySet()) {
+            List<String> lines = new ArrayList<>(entry.getValue().size());
+            for (String line : entry.getValue()) {
+                lines.add(normalizeEta(line));
+            }
+            compressed.put(entry.getKey(), lines);
+        }
+        return compressed;
     }
 
     private static String containerOf(String line) {

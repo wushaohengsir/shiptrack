@@ -6,18 +6,26 @@ import com.shiptrack.api.repo.EventRecord;
 import com.shiptrack.api.repo.EventRepository;
 import com.shiptrack.api.repo.NotificationRepository;
 import com.shiptrack.api.repo.OrderRepository;
+import com.shiptrack.api.repo.SnapshotRecord;
 import com.shiptrack.api.repo.SnapshotRepository;
 import com.shiptrack.api.support.JsonStore;
+import com.shiptrack.contract.dto.SourceEvent;
+import com.shiptrack.contract.enums.EventTimeType;
 import com.shiptrack.contract.enums.EventType;
 import com.shiptrack.contract.enums.NotificationStatus;
 import com.shiptrack.contract.enums.OrderNotificationState;
+import com.shiptrack.contract.enums.TransportStatus;
 import com.shiptrack.contract.internal.OrderNotificationResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -115,7 +123,7 @@ public class AggregationService {
             String containerNo = container == null ? "container-" + event.containerId()
                     : container.containerNo();
             StringBuilder line = new StringBuilder(containerNo)
-                    .append("  ").append(describe(event, container));
+                    .append("  ").append(describe(event));
             String route = route(container);
             if (route != null) {
                 line.append("  ").append(route);
@@ -125,11 +133,11 @@ public class AggregationService {
         return lines;
     }
 
-    private String describe(EventRecord event, ContainerRecord container) {
+    private String describe(EventRecord event) {
         EventType type = event.eventType();
         return switch (type) {
             case ETA_CHANGED, ETA_RECOVERED -> etaText(event, type);
-            case STATUS_CHANGED, STATUS_CORRECTED -> statusText(event, type, container);
+            case STATUS_CHANGED, STATUS_CORRECTED -> statusText(event, type);
             case QUERY_FAILED -> "查询失败，数据可能过期";
             case DATA_STALE -> "数据已过期，请人工核对";
             case QUERY_RECOVERED -> "查询已恢复";
@@ -140,26 +148,26 @@ public class AggregationService {
     private String etaText(EventRecord event, EventType type) {
         Map<String, Object> oldValue = jsonStore.readMap(event.oldValueJson());
         Map<String, Object> newValue = jsonStore.readMap(event.newValueJson());
-        String oldDate = dateOf(oldValue);
-        String newDate = dateOf(newValue);
+        String oldDisplay = etaDisplay(oldValue);
+        String newDisplay = etaDisplay(newValue);
 
         StringBuilder text = new StringBuilder("到港");
         if (type == EventType.ETA_RECOVERED) {
             text.append("已恢复");
-            if (newDate != null) {
-                text.append(' ').append(newDate);
+            if (newDisplay != null) {
+                text.append(' ').append(newDisplay);
             }
         } else {
-            if (oldDate != null) {
-                text.append(' ').append(oldDate).append(" → ");
+            if (oldDisplay != null) {
+                text.append(' ').append(oldDisplay).append(" → ");
             }
-            if (newDate != null) {
-                text.append(newDate);
+            if (newDisplay != null) {
+                text.append(newDisplay);
             }
         }
 
         List<String> parts = new ArrayList<>();
-        String last = lastChange(oldDate, newDate);
+        String last = lastChange(oldValue, newValue);
         if (last != null) {
             parts.add(last);
         }
@@ -177,26 +185,56 @@ public class AggregationService {
         return text.toString();
     }
 
-    private String statusText(EventRecord event, EventType type, ContainerRecord container) {
+    private String statusText(EventRecord event, EventType type) {
         Map<String, Object> value = jsonStore.readMap(event.newValueJson());
         String status = value == null ? null : text(value, "transport_status");
         if ("ARRIVED_POD".equals(status)) {
-            String date = arrivalDate(event, container);
+            String date = arrivalDate(event);
+            // Only an actual arrival trajectory may carry a date; the tracked
+            // (planned) ETA is never presented as the arrival date.
             return date == null ? "已到港" : "已到港（" + date + "）";
         }
         String label = status == null ? valueOf(event.newValueJson()) : status;
         return (type == EventType.STATUS_CHANGED ? "运输状态更新为 " : "运输状态修正为 ") + label;
     }
 
-    /** Actual source-event date first, then the tracked (planned) date, else omitted. */
-    private String arrivalDate(EventRecord event, ContainerRecord container) {
+    /**
+     * Actual arrival date: the event's own {@code source_event_at} first, then
+     * the ARRIVED_POD ACTUAL trajectory inside this attempt's snapshot. Falls
+     * back to omitting the date: a missing actual trajectory must never be
+     * replaced by the planned ETA.
+     */
+    private String arrivalDate(EventRecord event) {
         if (event.sourceEventAt() != null) {
             return event.sourceEventAt().toLocalDate().toString();
         }
-        if (container != null && container.trackedEtaDate() != null) {
-            return container.trackedEtaDate().toString();
+        if (event.toSnapshotId() == null) {
+            return null;
+        }
+        SnapshotRecord snapshot = snapshots.findById(event.toSnapshotId()).orElse(null);
+        if (snapshot == null) {
+            return null;
+        }
+        for (SourceEvent source : jsonStore.readSourceEvents(snapshot.sourceEventsJson())) {
+            if (source.milestone() == TransportStatus.ARRIVED_POD
+                    && source.eventTimeType() == EventTimeType.ACTUAL
+                    && source.occurredAt() != null) {
+                return arrivalLocalDate(source).toString();
+            }
         }
         return null;
+    }
+
+    private LocalDate arrivalLocalDate(SourceEvent source) {
+        if (source.timezone() != null) {
+            try {
+                return source.occurredAt().atZoneSameInstant(ZoneId.of(source.timezone()))
+                        .toLocalDate();
+            } catch (RuntimeException ignored) {
+                // Unknown zone: fall back to the offset carried by the timestamp.
+            }
+        }
+        return source.occurredAt().toLocalDate();
     }
 
     /** Only when both ends are present, so a half-known route is omitted deterministically. */
@@ -208,18 +246,62 @@ public class AggregationService {
         return "航线：" + container.pol() + " → " + container.pod();
     }
 
-    private String lastChange(String oldDate, String newDate) {
-        if (oldDate == null || newDate == null) {
+    /**
+     * §7.1 delta with the same rule as {@link DiffSupport}: two DATETIME ETAs
+     * are compared as UTC hours (so 12-07 23:30 → 12-09 00:30 is 25 hours, not
+     * 2 days); a DATE on either side falls back to whole local days.
+     */
+    private String lastChange(Map<String, Object> oldValue, Map<String, Object> newValue) {
+        if (oldValue == null || newValue == null) {
             return null;
         }
-        Long days = daysBetween(oldDate, newDate);
+        Long hours = hoursBetween(oldValue, newValue);
+        if (hours != null) {
+            if (hours == 0) {
+                return null;
+            }
+            return hours > 0 ? "较上次推迟 " + hours + " 小时"
+                    : "较上次提前 " + (-hours) + " 小时";
+        }
+        Long days = daysBetween(dateOf(oldValue), dateOf(newValue));
         if (days == null || days == 0) {
             return null;
         }
         return days > 0 ? "较上次推迟 " + days + " 天" : "较上次提前 " + (-days) + " 天";
     }
 
+    private Long hoursBetween(Map<String, Object> oldValue, Map<String, Object> newValue) {
+        if (!"DATETIME".equals(text(oldValue, "precision"))
+                || !"DATETIME".equals(text(newValue, "precision"))) {
+            return null;
+        }
+        java.time.Instant from = instantOf(oldValue);
+        java.time.Instant to = instantOf(newValue);
+        if (from == null || to == null) {
+            return null;
+        }
+        return Duration.between(from, to).toHours();
+    }
+
+    private java.time.Instant instantOf(Map<String, Object> value) {
+        String date = text(value, "date");
+        String time = text(value, "time");
+        String zone = text(value, "timezone");
+        if (date == null || time == null || zone == null) {
+            return null;
+        }
+        try {
+            return ZonedDateTime.of(LocalDate.parse(date), LocalTime.parse(time), ZoneId.of(zone))
+                    .toInstant();
+        } catch (RuntimeException error) {
+            return null;
+        }
+    }
+
     private Long daysBetween(String from, String to) {
+        if (from == null || to == null) {
+            return null;
+        }
         try {
             return java.time.temporal.ChronoUnit.DAYS.between(
                     LocalDate.parse(from), LocalDate.parse(to));
@@ -259,6 +341,20 @@ public class AggregationService {
 
     private String dateOf(Map<String, Object> value) {
         return value == null ? null : text(value, "date");
+    }
+
+    /**
+     * §7.5 step ③: a DATETIME ETA keeps its {@code HH:MM} in the full message;
+     * only the date-compression stage drops it. A DATE ETA never gains a
+     * fabricated {@code 00:00}.
+     */
+    private String etaDisplay(Map<String, Object> value) {
+        String date = dateOf(value);
+        if (date == null || !"DATETIME".equals(text(value, "precision"))) {
+            return date;
+        }
+        String time = text(value, "time");
+        return time == null || time.isBlank() ? date : date + " " + time;
     }
 
     private String valueOf(String json) {

@@ -61,6 +61,8 @@ class FeishuClientTest {
                 case "statusCode" -> body = "{\"StatusCode\":0,\"msg\":\"upstream-diagnostic-xyz\"}";
                 case "codeHuge" -> body = "{\"code\":4294967296,\"msg\":\"upstream-diagnostic-xyz\"}";
                 case "codeDecimalZero" -> body = "{\"code\":0.0,\"msg\":\"success\"}";
+                case "codeUnderflow" -> body = "{\"code\":1e-400,\"msg\":\"upstream-diagnostic-xyz\"}";
+                case "codeTrailing" -> body = "{\"code\":0}garbage";
                 case "plain" -> body = "not-json";
                 default -> {
                 }
@@ -197,6 +199,21 @@ class FeishuClientTest {
         assertFalse(result.success(), "4294967296 must not wrap into 0");
         assertTrue(result.error().contains("4294967296"), result.error());
         assertEquals(200, result.responseCode());
+    }
+
+    @Test
+    void onlyAnExactZeroWithoutTrailingContentIsSuccess() {
+        for (String mode : List.of("codeUnderflow", "codeTrailing")) {
+            BODIES.clear();
+            MODE.set(mode);
+            FeishuClient.FeishuSendResult result =
+                    new FeishuClient(properties(2000, "")).sendFirst(List.of("x"));
+
+            assertFalse(result.success(), mode + " must not be treated as success");
+            assertEquals(200, result.responseCode(), mode);
+            assertFalse(result.error().contains("upstream-diagnostic-xyz"),
+                    mode + ": " + result.error());
+        }
     }
 
     @Test

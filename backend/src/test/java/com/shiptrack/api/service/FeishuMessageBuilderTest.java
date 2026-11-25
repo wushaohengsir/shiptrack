@@ -66,14 +66,31 @@ class FeishuMessageBuilderTest {
     }
 
     @Test
-    void etaDateTimeIsCompressedToADate() {
+    void theFullBodyKeepsPrecisionAndOnlyTheCompressionStageTrims() {
         List<String> lines = List.of(
                 "MSDU7172233  到港 2026-12-07 08:00 → 2026-12-09 16:30");
-        String full = FeishuMessageBuilder.candidates(payload(lines), KEY, null).get(0);
+        List<String> candidates = FeishuMessageBuilder.candidates(payload(lines), KEY, null);
 
-        assertTrue(full.contains("到港 2026-12-07 → 2026-12-09"), full);
-        assertFalse(full.contains("08:00"), full);
-        assertFalse(full.contains("16:30"), full);
+        String full = candidates.get(0);
+        assertTrue(full.contains("08:00"), full);
+        assertTrue(full.contains("16:30"), full);
+
+        String compressed = candidates.stream()
+                .filter(candidate -> candidate.contains("到港 2026-12-07 → 2026-12-09"))
+                .findFirst().orElseThrow();
+        assertFalse(compressed.contains("08:00"), compressed);
+        assertFalse(compressed.contains("16:30"), compressed);
+    }
+
+    @Test
+    void aSingleShortIsoDatetimeOnlyLosesItsTimeInTheCompressionStage() {
+        List<String> lines = List.of("MSDU7172233  到港 2026-12-09T13:20:00+08:00");
+        List<String> candidates = FeishuMessageBuilder.candidates(payload(lines), KEY, null);
+
+        assertTrue(candidates.get(0).contains("2026-12-09T13:20:00+08:00"), candidates.get(0));
+        assertTrue(candidates.stream().anyMatch(candidate ->
+                        candidate.contains("到港 2026-12-09") && !candidate.contains("13:20")),
+                candidates.toString());
     }
 
     @Test

@@ -388,7 +388,64 @@ class NotificationIntegrationTest {
         assertTrue(dispatcher.dispatchOnce() >= 1);
         String text = sentText(key);
         assertTrue(text.contains("• MSDU7172233  已到港"), text);
+        assertFalse(text.contains("已到港（"),
+                "a missing actual trajectory must not print the planned ETA: " + text);
         assertTrue(text.contains("航线：Ningbo, CN → Vancouver, CA"), text);
+    }
+
+    @Test
+    void etaDeltaAcrossMidnightUsesHoursNotCalendarDays() throws Exception {
+        BODIES.clear();
+        Map<String, Object> order = createOrder("PO-IT-ETA-HOURS");
+        long orderId = ((Number) order.get("id")).longValue();
+        long containerId = firstContainerId(order);
+
+        String run1 = refreshContainer(containerId);
+        report(run1, containerId, (String) claim(run1).get("claim_token"),
+                dateTimeEta("2026-12-07", "23:30", "America/Vancouver",
+                        "2026-12-08T07:30:00Z"),
+                List.of(loadedEvent()), "DEPARTED");
+        String run2 = refreshContainer(containerId);
+        Map<String, Object> reportBody = report(run2, containerId,
+                (String) claim(run2).get("claim_token"),
+                dateTimeEta("2026-12-09", "00:30", "America/Vancouver",
+                        "2026-12-09T08:30:00Z"),
+                List.of(loadedEvent()), "DEPARTED");
+        assertEquals("created",
+                ((Map<?, ?>) reportBody.get("order_notification")).get("state"));
+        String key = "order:" + orderId + ":run:" + run2 + ":channel:feishu";
+
+        assertTrue(dispatcher.dispatchOnce() >= 1);
+        String text = sentText(key);
+        assertTrue(text.contains("到港 2026-12-07 23:30 → 2026-12-09 00:30"), text);
+        assertTrue(text.contains("较上次推迟 25 小时"), text);
+        assertTrue(text.contains("较基线累计推迟 25 小时"), text);
+        assertFalse(text.contains("较上次推迟 2 天"), text);
+    }
+
+    @Test
+    void arrivalDateComesFromTheActualTrajectory() throws Exception {
+        BODIES.clear();
+        Map<String, Object> order = createOrder("PO-IT-ARRIVAL-DATE");
+        long orderId = ((Number) order.get("id")).longValue();
+        long containerId = firstContainerId(order);
+
+        String run1 = refreshContainer(containerId);
+        report(run1, containerId, (String) claim(run1).get("claim_token"),
+                "2026-12-09", "DEPARTED");
+        String run2 = refreshContainer(containerId);
+        report(run2, containerId, (String) claim(run2).get("claim_token"),
+                dateEta("2026-12-09"),
+                List.of(loadedEvent(),
+                        arrivalEvent("2026-12-10T14:30:00-08:00", "America/Vancouver")),
+                "ARRIVED_POD");
+        String key = "order:" + orderId + ":run:" + run2 + ":channel:feishu";
+
+        assertTrue(dispatcher.dispatchOnce() >= 1);
+        String text = sentText(key);
+        assertTrue(text.contains("已到港（2026-12-10）"), text);
+        assertFalse(text.contains("已到港（2026-12-09）"),
+                "the tracked ETA must not be shown as the arrival date: " + text);
     }
 
     @Test
@@ -636,24 +693,14 @@ class NotificationIntegrationTest {
 
     private Map<String, Object> report(String runId, long containerId, String token,
                                        String etaDate, String transportStatus) throws Exception {
-        Map<String, Object> eta = new LinkedHashMap<>();
-        eta.put("milestone", "POD_ARRIVAL");
-        eta.put("raw_value", etaDate);
-        eta.put("date", etaDate);
-        eta.put("time", null);
-        eta.put("timezone", "America/Vancouver");
-        eta.put("precision", "DATE");
-        eta.put("utc_at", null);
-        Map<String, Object> event = new LinkedHashMap<>();
-        event.put("milestone", "LOADED");
-        event.put("event_time_type", "actual");
-        event.put("occurred_at", "2026-11-21T16:20:00+08:00");
-        event.put("timezone", "Asia/Shanghai");
-        event.put("location", "Ningbo, CN");
-        event.put("vessel", "CAPE SOUNIO");
-        event.put("voyage", "UK647R");
-        event.put("raw_text", "Loaded on vessel");
+        return report(runId, containerId, token, dateEta(etaDate), List.of(loadedEvent()),
+                transportStatus);
+    }
 
+    private Map<String, Object> report(String runId, long containerId, String token,
+                                       Map<String, Object> eta,
+                                       List<Map<String, Object>> sourceEvents,
+                                       String transportStatus) throws Exception {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("run_id", runId);
         payload.put("container_id", containerId);
@@ -667,7 +714,7 @@ class NotificationIntegrationTest {
         payload.put("raw_status", "Loaded on vessel CAPE SOUNIO/UK647R at Ningbo");
         payload.put("transport_status", transportStatus);
         payload.put("etas", List.of(eta));
-        payload.put("source_events", List.of(event));
+        payload.put("source_events", sourceEvents);
         payload.put("location", "Busan, KR");
         payload.put("vessel", "CAPE SOUNIO");
         payload.put("voyage", "UK647R");
@@ -683,6 +730,55 @@ class NotificationIntegrationTest {
                 .andReturn();
         assertEquals(200, result.getResponse().getStatus(), bodyText(result));
         return body(result);
+    }
+
+    private static Map<String, Object> dateEta(String date) {
+        Map<String, Object> eta = new LinkedHashMap<>();
+        eta.put("milestone", "POD_ARRIVAL");
+        eta.put("raw_value", date);
+        eta.put("date", date);
+        eta.put("time", null);
+        eta.put("timezone", "America/Vancouver");
+        eta.put("precision", "DATE");
+        eta.put("utc_at", null);
+        return eta;
+    }
+
+    private static Map<String, Object> dateTimeEta(String date, String time, String zone,
+                                                   String utcAt) {
+        Map<String, Object> eta = new LinkedHashMap<>();
+        eta.put("milestone", "POD_ARRIVAL");
+        eta.put("raw_value", date + " " + time);
+        eta.put("date", date);
+        eta.put("time", time);
+        eta.put("timezone", zone);
+        eta.put("precision", "DATETIME");
+        eta.put("utc_at", utcAt);
+        return eta;
+    }
+
+    private static Map<String, Object> loadedEvent() {
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("milestone", "LOADED");
+        event.put("event_time_type", "actual");
+        event.put("occurred_at", "2026-11-21T16:20:00+08:00");
+        event.put("timezone", "Asia/Shanghai");
+        event.put("location", "Ningbo, CN");
+        event.put("vessel", "CAPE SOUNIO");
+        event.put("voyage", "UK647R");
+        event.put("raw_text", "Loaded on vessel");
+        return event;
+    }
+
+    private static Map<String, Object> arrivalEvent(String occurredAt, String zone) {
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("milestone", "ARRIVED_POD");
+        event.put("event_time_type", "actual");
+        event.put("occurred_at", occurredAt);
+        event.put("timezone", zone);
+        event.put("location", "Vancouver, CA");
+        event.put("raw_text", "Arrived at POD");
+        return event;
     }
 
     private Map<String, Object> reportFailure(String runId, long containerId, String token)
