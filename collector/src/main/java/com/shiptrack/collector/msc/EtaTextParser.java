@@ -30,6 +30,16 @@ public final class EtaTextParser {
             // and both sides of that date are word characters.
             Pattern.compile("(?<!\\d)(\\d{4}-\\d{2}-\\d{2})(?!\\d)"));
 
+    /**
+     * Numeric dates such as {@code 07/12/2026}. The separator order is a site
+     * property, not something to infer from the value: MSC renders the first
+     * component as the day. Ambiguity is resolved by that declared order, and
+     * a value that is impossible in that order is dropped rather than silently
+     * re-read in the other order.
+     */
+    private static final Pattern SLASH_DATE = Pattern.compile(
+            "(?<![\\d/])(\\d{1,2})/(\\d{1,2})/(\\d{4})(?![\\d/])");
+
     private static final List<DateTimeFormatter> DATE_FORMATS = List.of(
             formatter("MMM d uuuu"),
             formatter("MMMM d uuuu"),
@@ -71,7 +81,17 @@ public final class EtaTextParser {
     private EtaTextParser() {
     }
 
+    /** How a numeric {@code a/b/yyyy} date is read. MSC uses day-first. */
+    public enum DateOrder {
+        DAY_FIRST,
+        MONTH_FIRST
+    }
+
     public static Optional<LocalDate> parseDate(String text) {
+        return parseDate(text, DateOrder.DAY_FIRST);
+    }
+
+    public static Optional<LocalDate> parseDate(String text, DateOrder order) {
         if (text == null || text.isBlank()) {
             return Optional.empty();
         }
@@ -91,6 +111,36 @@ public final class EtaTextParser {
                     // try the next format
                 }
             }
+        }
+        Matcher slash = SLASH_DATE.matcher(text);
+        if (slash.find()) {
+            return slashDate(slash, order == null ? DateOrder.DAY_FIRST : order);
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Reads the two numeric components in the declared order only. If that
+     * order produces no real calendar date (for example {@code 12/25/2026}
+     * read day-first), the value is dropped: switching to the other order
+     * would be an unstated guess about the site's locale.
+     */
+    private static Optional<LocalDate> slashDate(Matcher matcher, DateOrder order) {
+        int first = Integer.parseInt(matcher.group(1));
+        int second = Integer.parseInt(matcher.group(2));
+        int year = Integer.parseInt(matcher.group(3));
+        int day = order == DateOrder.MONTH_FIRST ? second : first;
+        int month = order == DateOrder.MONTH_FIRST ? first : second;
+        if (month < 1 || month > 12) {
+            return Optional.empty();
+        }
+        try {
+            LocalDate date = LocalDate.of(year, month, day);
+            if (date.getYear() >= 2000 && date.getYear() <= 2100) {
+                return Optional.of(date);
+            }
+        } catch (RuntimeException ignored) {
+            // Day out of range for that month (32/13, Feb 30, ...).
         }
         return Optional.empty();
     }
@@ -136,6 +186,10 @@ public final class EtaTextParser {
                 count++;
             }
         }
+        Matcher slash = SLASH_DATE.matcher(text);
+        while (slash.find()) {
+            count++;
+        }
         return count;
     }
 
@@ -144,7 +198,11 @@ public final class EtaTextParser {
      * zone. Anything less is left to the caller as date-only.
      */
     public static Optional<OffsetDateTime> parseDateTime(String text) {
-        Optional<LocalDate> date = parseDate(text);
+        return parseDateTime(text, DateOrder.DAY_FIRST);
+    }
+
+    public static Optional<OffsetDateTime> parseDateTime(String text, DateOrder order) {
+        Optional<LocalDate> date = parseDate(text, order);
         Optional<ZonedTime> time = parseTime(text);
         if (date.isEmpty() || time.isEmpty()) {
             return Optional.empty();

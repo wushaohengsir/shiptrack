@@ -109,6 +109,49 @@ class EtaTextParserTest {
     }
 
     @Test
+    void readsTheSitesNumericDatesDayFirst() {
+        // Live MSC page, 2026-11-25: POD ETA 07/12/2026 = 7 December.
+        assertThat(EtaTextParser.parseDate("POD ETA 07/12/2026"))
+                .contains(LocalDate.of(2026, 12, 7));
+        assertThat(EtaTextParser.parseDate("21/11/2026 Busan, KR Full Transshipment Loaded"))
+                .contains(LocalDate.of(2026, 11, 21));
+        // A day above 12 can only be a day, not a month.
+        assertThat(EtaTextParser.parseDate("25/11/2026")).contains(LocalDate.of(2026, 11, 25));
+    }
+
+    @Test
+    void resolvesDayMonthAmbiguityByTheDeclaredOrderAndNeverByGuessing() {
+        // 07/12 is ambiguous (both <= 12). The site order decides: day first.
+        LocalDate seventhOfDecember = EtaTextParser.parseDate("07/12/2026").orElseThrow();
+        assertThat(seventhOfDecember).isEqualTo(LocalDate.of(2026, 12, 7));
+        assertThat(seventhOfDecember)
+                .as("must not be silently read as MM/dd")
+                .isNotEqualTo(LocalDate.of(2026, 7, 12));
+
+        // Same digits, reversed: still day-first, so this is 12 July.
+        assertThat(EtaTextParser.parseDate("12/07/2026")).contains(LocalDate.of(2026, 7, 12));
+
+        // Impossible day-first (month 25): dropped, not re-read as MM/dd.
+        assertThat(EtaTextParser.parseDate("12/25/2026")).isEmpty();
+        assertThat(EtaTextParser.parseDate("13/13/2026")).isEmpty();
+        assertThat(EtaTextParser.parseDate("31/02/2026")).isEmpty();
+
+        // The policy is explicit, so a month-first site can be configured
+        // without changing the parser.
+        assertThat(EtaTextParser.parseDate("12/25/2026", EtaTextParser.DateOrder.MONTH_FIRST))
+                .contains(LocalDate.of(2026, 12, 25));
+        assertThat(EtaTextParser.parseDate("07/12/2026", EtaTextParser.DateOrder.MONTH_FIRST))
+                .contains(LocalDate.of(2026, 7, 12));
+    }
+
+    @Test
+    void countsNumericDatesForTheAmbiguityGuard() {
+        assertThat(EtaTextParser.dateOccurrences("07/12/2026 Vancouver Estimated Time of Arrival"))
+                .isEqualTo(1);
+        assertThat(EtaTextParser.dateOccurrences("07/12/2026 and 21/11/2026")).isEqualTo(2);
+    }
+
+    @Test
     void keepsAHalfHourOffsetAccurateEvenThoughItCannotBeNamedInIanaForm() {
         OffsetDateTime offset = EtaTextParser.parseDateTime("2026-12-06 14:30 UTC+05:30").orElseThrow();
         assertThat(offset.toInstant()).isEqualTo(Instant.parse("2026-12-06T09:00:00Z"));

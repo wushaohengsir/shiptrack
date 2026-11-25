@@ -16,9 +16,11 @@ import org.springframework.stereotype.Component;
 
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -242,11 +244,12 @@ public class MscProbe implements MscTrackingClient {
                     "MSC tracking form was not found; the page structure likely changed");
         }
 
-        // Record what the page already shows for this container, including a
-        // hidden block: a block that was there before the click was not
-        // produced by this query. Its nodes are marked so a later read can
-        // prove the block was re-rendered instead of merely re-timed.
-        ResultIdentity beforeSubmit = recordResultBaseline(page, containerNo, deadline);
+        // Record every block that already shows this container, including
+        // hidden ones: a block that was there before the click was not
+        // produced by this query. Each candidate is stamped with its own
+        // marker so a later read can tell a re-render from a block that was
+        // merely revealed.
+        ResultBaseline beforeSubmit = recordResultBaseline(page, containerNo, deadline);
 
         long submitStartedAt = System.currentTimeMillis();
         AtomicReference<SubmitResponse> correlated = new AtomicReference<>();
@@ -283,8 +286,12 @@ public class MscProbe implements MscTrackingClient {
                 return formFailure(deadline, run, "MSC tracking form could not be filled or submitted");
             }
 
-            WaitResult wait = waitForResult(page, containerNo, deadline, correlated, beforeSubmit);
-            MscPageSnapshot snapshot = capture(page, containerNo, deadline, false);
+            WaitOutcome wait = waitForResult(page, containerNo, deadline, correlated, beforeSubmit);
+            // Parse exactly the read that proved a fresh render. Re-reading the
+            // block here would let the page change between the ownership check
+            // and the parse, which is the staging window this fix closes.
+            MscPageSnapshot snapshot =
+                    capture(page, containerNo, deadline, false, wait.observation());
 
             Optional<AgentErrorCode> error = errorClassifier.classify(snapshot);
             if (error.isPresent()) {
@@ -296,7 +303,7 @@ public class MscProbe implements MscTrackingClient {
             // background failure. Only a correlated tracking error, or a
             // failure when no result rendered, is terminal here.
             if (response != null && response.status() >= 400
-                    && (response.correlated() || wait != WaitResult.RESULT)) {
+                    && (response.correlated() || wait.result() != WaitResult.RESULT)) {
                 AgentErrorCode code = statusError(response.status());
                 if (code != null) {
                     if (response.status() == 429) {
@@ -313,24 +320,12 @@ public class MscProbe implements MscTrackingClient {
             }
             // A block that was already visible before submission was never
             // proven to belong to this query. Publishing it is exactly the
-            // stale-result bug AC-29 forbids.
-            if (wait != WaitResult.RESULT && snapshot.resultBlockText() != null) {
+            // stale-result bug AC-29 forbids. When no fresh render was
+            // observed, the snapshot above holds the stale block (if any), so
+            // this is a classified timeout, never a success.
+            if (wait.result() != WaitResult.RESULT && snapshot.resultBlockText() != null) {
                 recordFailure(run);
                 return timeout("MSC result block was not refreshed for container " + containerNo);
-            }
-            // Final ownership proof: the block the parser is about to read must
-            // still be a render produced by this query. A background beacon's
-            // 200, a clock label ticking or the pre-submit block left in place
-            // never satisfies this check.
-            if (beforeSubmit != null) {
-                ResultObservation finalRender =
-                        observeResult(page, containerNo, deadline, beforeSubmit.marker());
-                if (finalRender == null || finalRender.ambiguous()
-                        || !renderFresh(beforeSubmit, finalRender)) {
-                    recordFailure(run);
-                    return timeout("MSC result block is still the pre-submit result for container "
-                            + containerNo);
-                }
             }
 
             try {
@@ -340,7 +335,7 @@ public class MscProbe implements MscTrackingClient {
             } catch (MscParseException e) {
                 recordFailure(run);
                 return new TrackingOutcome.Failure(
-                        resolveUnparsable(snapshot, containerNo, wait == WaitResult.RESULT),
+                        resolveUnparsable(snapshot, containerNo, wait.result() == WaitResult.RESULT),
                         e.getMessage());
             }
         } finally {
@@ -420,57 +415,107 @@ public class MscProbe implements MscTrackingClient {
      * what lets a late captcha be reported as such instead of waiting the full
      * budget for a result selector that will never appear.
      */
-    private WaitResult waitForResult(Page page, String containerNo, long deadline,
-                                     AtomicReference<SubmitResponse> correlated,
-                                     ResultIdentity beforeSubmit) {
+    private WaitOutcome waitForResult(Page page, String containerNo, long deadline,
+                                      AtomicReference<SubmitResponse> correlated,
+                                      ResultBaseline beforeSubmit) {
         long resultDeadline = Math.min(deadline,
                 System.nanoTime() + Math.max(0, properties.getResultWaitMs()) * 1_000_000L);
-        String marker = beforeSubmit == null ? null : beforeSubmit.marker();
         while (true) {
-            ResultObservation render = observeResult(page, containerNo, resultDeadline, marker);
+            ResultObservation render = observeResult(page, containerNo, resultDeadline, beforeSubmit);
             SubmitResponse response = correlated.get();
             if (response != null && response.status() >= 400) {
-                return WaitResult.HTTP_ERROR;
+                return new WaitOutcome(WaitResult.HTTP_ERROR, null);
             }
             // A visible block only counts when it names the queried container
             // and this query actually re-rendered it. A 2xx from anywhere, a
-            // clock label ticking or the pre-submit block still in place is
-            // not a render and must keep waiting.
+            // clock label ticking, a row disappearing or the pre-submit block
+            // left in place is not a render and must keep waiting.
             if (render != null && !render.ambiguous() && renderFresh(beforeSubmit, render)) {
-                return WaitResult.RESULT;
+                return new WaitOutcome(WaitResult.RESULT, render);
             }
             if (errorClassifier.classify(capture(page, containerNo, deadline, true)).isPresent()) {
-                return WaitResult.SIGNAL;
+                return new WaitOutcome(WaitResult.SIGNAL, render);
             }
             long remaining = remainingMsOrZero(resultDeadline);
             if (remaining <= 0) {
-                return WaitResult.PENDING;
+                return new WaitOutcome(WaitResult.PENDING, render);
             }
             sleep(Math.min(POLL_INTERVAL_MS, remaining));
         }
     }
 
     /**
-     * A render is fresh only when the query replaced part of the result view.
-     * Either a marked node is gone (the page rebuilt the block) or the visible
-     * status/timeline values changed. An unrelated text change, a background
-     * response or a time label alone never qualifies, so a stale "picked up"
-     * value cannot trigger the early stop.
+     * A render is fresh only when this query actually produced it.
+     *
+     * <ul>
+     *   <li>The visible block still carries a pre-submit stamp: only a
+     *       substantive status/summary/timeline change counts. Removing an old
+     *       row, revealing a hidden block or re-timing a label never does, so
+     *       a staged page cannot publish its old "picked up" status.</li>
+     *   <li>The block carries no pre-submit stamp: the page rebuilt the result
+     *       region. The parser re-validates container, status and rows in the
+     *       same read.</li>
+     * </ul>
      */
-    private static boolean renderFresh(ResultIdentity before, ResultObservation now) {
-        if (before == null) {
+    private static boolean renderFresh(ResultBaseline before, ResultObservation now) {
+        if (before == null || before.blocks().isEmpty()) {
             // Nothing showed this container before the click, so the block is
             // new. The parser still validates its container, status and rows.
             return true;
         }
-        if (before.markedNodes() > 0 && now.markedNodes() >= 0
-                && now.markedNodes() < before.markedNodes()) {
+        String marker = now.marker();
+        if (marker == null) {
+            // The stamped block is gone: the query replaced the result region.
             return true;
         }
+        BlockBaseline baseline = before.forMarker(marker);
+        if (baseline == null) {
+            return false;
+        }
+        // The block root survived but every stamped child is gone: the page
+        // rebuilt the block's content. A staged render only removes one row or
+        // reveals a sibling, so it still carries several stamps and never
+        // reaches this branch.
+        if (baseline.marked() > 1 && now.markedCount() == 1) {
+            return true;
+        }
+        return substantiveChange(baseline.facts(), now.facts());
+    }
+
+    /**
+     * A change that proves the query re-rendered the result instead of merely
+     * editing the old one. A timeline that only loses a row is a staged render
+     * (the page clears the old row before it publishes the new status), so it
+     * is deliberately not treated as freshness.
+     */
+    private static boolean substantiveChange(ResultFacts before, ResultFacts now) {
         if (!normalizeText(before.status()).equals(normalizeText(now.status()))) {
             return true;
         }
-        return !normalizedLines(before.events()).equals(normalizedLines(now.events()));
+        if (!normalizedMap(before.summary()).equals(normalizedMap(now.summary()))) {
+            return true;
+        }
+        List<List<String>> oldRows = normalizedRows(before.eventRows());
+        List<List<String>> newRows = normalizedRows(now.eventRows());
+        if (oldRows.equals(newRows)) {
+            return false;
+        }
+        // Rows may only be added or changed; a pure deletion is not a render.
+        return newRows.size() >= oldRows.size();
+    }
+
+    private static Map<String, String> normalizedMap(Map<String, String> values) {
+        Map<String, String> normalized = new LinkedHashMap<>();
+        values.forEach((key, value) -> normalized.put(normalizeText(key), normalizeText(value)));
+        return normalized;
+    }
+
+    private static List<List<String>> normalizedRows(List<List<String>> rows) {
+        List<List<String>> normalized = new ArrayList<>(rows.size());
+        for (List<String> row : rows) {
+            normalized.add(normalizedLines(row));
+        }
+        return normalized;
     }
 
     private static List<String> normalizedLines(List<String> lines) {
@@ -698,6 +743,17 @@ public class MscProbe implements MscTrackingClient {
      *              loop so a repeated capture stays cheap
      */
     private MscPageSnapshot capture(Page page, String containerNo, long deadline, boolean light) {
+        return capture(page, containerNo, deadline, light, null);
+    }
+
+    /**
+     * Captures the page. When {@code observation} is the read that proved a
+     * fresh render, its facts are used verbatim instead of re-reading the
+     * block: re-reading would open a window in which the page could change
+     * again after freshness was established.
+     */
+    private MscPageSnapshot capture(Page page, String containerNo, long deadline, boolean light,
+                                    ResultObservation observation) {
         String title = safe(page::title);
         String url = safe(page::url);
         String body = safe(() -> page.locator("body")
@@ -711,6 +767,17 @@ public class MscProbe implements MscTrackingClient {
             return new MscPageSnapshot(title, url, body, null, List.of(), passwordField);
         }
 
+        if (observation != null) {
+            String provenText = observation.blockText();
+            if (provenText != null && provenText.length() > properties.getMaxBodyChars()) {
+                provenText = provenText.substring(0, properties.getMaxBodyChars());
+            }
+            ResultFacts proven = observation.facts();
+            return new MscPageSnapshot(title, url, body, proven.status(), proven.events(),
+                    passwordField, provenText, observation.ambiguous(),
+                    proven.summary(), proven.eventRows());
+        }
+
         // Read the status and timeline only from the visible result block that
         // names the queried container, and only from visible elements. A hidden
         // node inside another block can carry a different box's "picked up";
@@ -721,6 +788,8 @@ public class MscProbe implements MscTrackingClient {
         String blockText = null;
         String statusText = null;
         List<String> eventLines = List.of();
+        Map<String, String> summaryFacts = Map.of();
+        List<List<String>> eventRows = List.of();
         if (block != null) {
             blockText = innerText(block, captureTimeout(deadline));
             if (blockText != null && blockText.length() > properties.getMaxBodyChars()) {
@@ -729,10 +798,12 @@ public class MscProbe implements MscTrackingClient {
             ResultFacts facts = factsOf(block, deadline, true);
             statusText = facts.status();
             eventLines = facts.events();
+            summaryFacts = facts.summary();
+            eventRows = facts.eventRows();
             ambiguous = ambiguous || facts.ambiguous();
         }
         return new MscPageSnapshot(title, url, body, statusText, eventLines,
-                passwordField, blockText, ambiguous);
+                passwordField, blockText, ambiguous, summaryFacts, eventRows);
     }
 
     /**
@@ -748,14 +819,89 @@ public class MscProbe implements MscTrackingClient {
         String status = distinct.size() == 1 ? statuses.getFirst() : null;
         boolean ambiguous = distinct.size() > 1;
 
-        List<String> events = new ArrayList<>();
-        for (Locator row : nodes(block, properties.getEventRowSelector(), visibleOnly)) {
-            String line = visibleOnly ? innerText(row, timeout) : textContent(row, timeout);
-            if (line != null && !line.isBlank()) {
-                events.add(line.trim());
+        Map<String, String> summary = new LinkedHashMap<>();
+        for (Locator cell : nodes(block, properties.getSummarySelector(), visibleOnly)) {
+            String heading = firstText(cell, properties.getSummaryHeadingSelector(), timeout, visibleOnly);
+            String value = firstText(cell, properties.getSummaryValueSelector(), timeout, visibleOnly);
+            if (heading != null && value != null) {
+                String key = heading.trim();
+                String existing = summary.putIfAbsent(key, value.trim());
+                if (existing != null && !normalizeText(existing).equals(normalizeText(value))) {
+                    // Two different values under one heading: the block does
+                    // not describe one shipment.
+                    ambiguous = true;
+                }
             }
         }
-        return new ResultFacts(status, events, ambiguous);
+
+        List<String> events = new ArrayList<>();
+        List<List<String>> eventRows = new ArrayList<>();
+        for (Locator row : nodes(block, properties.getEventRowSelector(), visibleOnly)) {
+            String line = visibleOnly ? innerText(row, timeout) : textContent(row, timeout);
+            if (line == null || line.isBlank()) {
+                continue;
+            }
+            List<String> cells = new ArrayList<>(cellsOf(row, timeout, visibleOnly));
+            if (cells.isEmpty()) {
+                for (String cell : line.split("\\R")) {
+                    String trimmed = cell.trim();
+                    if (!trimmed.isEmpty()) {
+                        cells.add(trimmed);
+                    }
+                }
+            }
+            if (cells.isEmpty()) {
+                continue;
+            }
+            eventRows.add(cells);
+            events.add(String.join(" | ", cells));
+        }
+        return new ResultFacts(status, events, summary, eventRows, ambiguous);
+    }
+
+    /**
+     * The value cells of a structured event row (the live card places one
+     * {@code data-value} span per column on a single visual line). At least two
+     * cells are required: a lone match is not a table and is left to the plain
+     * text fallback.
+     */
+    private List<String> cellsOf(Locator row, int timeoutMs, boolean visibleOnly) {
+        List<String> cells = new ArrayList<>();
+        try {
+            Locator values = row.locator(properties.getSummaryValueSelector());
+            int count = Math.min(values.count(), 20);
+            for (int i = 0; i < count; i++) {
+                Locator value = values.nth(i);
+                if (visibleOnly && !value.isVisible()) {
+                    continue;
+                }
+                String text = visibleOnly ? innerText(value, timeoutMs) : textContent(value, timeoutMs);
+                if (text != null && !text.isBlank()) {
+                    cells.add(text.trim());
+                }
+            }
+        } catch (PlaywrightException e) {
+            cells.clear();
+        }
+        return cells.size() >= 2 ? cells : List.of();
+    }
+
+    /** Text of the first matching child, or null when the selector finds none. */
+    private static String firstText(Locator scope, String selector, int timeoutMs, boolean visibleOnly) {
+        try {
+            Locator items = scope.locator(selector);
+            if (items.count() == 0) {
+                return null;
+            }
+            Locator first = items.first();
+            if (visibleOnly && !first.isVisible()) {
+                return null;
+            }
+            String text = visibleOnly ? innerText(first, timeoutMs) : textContent(first, timeoutMs);
+            return text == null || text.isBlank() ? null : text.trim();
+        } catch (PlaywrightException e) {
+            return null;
+        }
     }
 
     private static List<Locator> nodes(Locator scope, String selector, boolean visibleOnly) {
@@ -881,38 +1027,60 @@ public class MscProbe implements MscTrackingClient {
     }
 
     /**
-     * Reads the visible result block for this container. {@code marker} is the
-     * baseline stamp; the observation counts how many stamped nodes this block
-     * still holds, so the caller can tell a re-render from leftover text.
+     * Reads the visible result block for this container in one pass: identity,
+     * container text, status and timeline. {@code before} supplies the
+     * pre-submit stamps, so the observation can report which candidate block
+     * (if any) it is looking at.
      */
     private ResultObservation observeResult(Page page, String containerNo, long deadline,
-                                            String marker) {
+                                            ResultBaseline before) {
         List<Locator> blocks = resultBlocksFor(page, containerNo, false, deadline);
         if (blocks.isEmpty()) {
             return null;
         }
         Locator block = blocks.getFirst();
+        String blockText = innerText(block, captureTimeout(deadline));
         ResultFacts facts = factsOf(block, deadline, true);
         boolean ambiguous = facts.ambiguous() || blocks.size() > 1;
-        int marked = marker == null ? -1 : countMarked(block, marker);
-        return new ResultObservation(facts.status(), facts.events(), ambiguous, marked);
+        String marker = before == null ? null : markerOn(block, before);
+        int markedCount = marker == null ? 0 : countMarked(block, marker);
+        return new ResultObservation(blockText, facts, ambiguous, marker, markedCount);
     }
 
     /**
-     * Records the block that already exists for this container before the click
-     * and stamps it. A later read proves freshness by the stamp disappearing
-     * (the page rebuilt the block) or by the visible facts changing.
+     * Records every block that already exists for this container before the
+     * click and stamps each one with its own marker. A later read proves
+     * freshness by that block's stamp disappearing (a rebuild) or by its
+     * visible facts substantively changing. Marking all candidates means a
+     * second pre-existing block that is merely revealed cannot pass as new.
      */
-    private ResultIdentity recordResultBaseline(Page page, String containerNo, long deadline) {
+    private ResultBaseline recordResultBaseline(Page page, String containerNo, long deadline) {
         List<Locator> blocks = resultBlocksFor(page, containerNo, true, deadline);
         if (blocks.isEmpty()) {
             return null;
         }
-        Locator block = blocks.getFirst();
-        String marker = "m" + UUID.randomUUID().toString().replace("-", "");
-        int marked = mark(block, marker);
-        ResultFacts facts = factsOf(block, deadline, false);
-        return new ResultIdentity(marker, marked, facts.status(), facts.events());
+        List<BlockBaseline> baselines = new ArrayList<>(blocks.size());
+        for (Locator block : blocks) {
+            String marker = "m" + UUID.randomUUID().toString().replace("-", "");
+            int marked = mark(block, marker);
+            if (marked == 0) {
+                // Could not stamp this candidate; it cannot be proven fresh
+                // later, so record no baseline for it.
+                continue;
+            }
+            baselines.add(new BlockBaseline(marker, marked, factsOf(block, deadline, false)));
+        }
+        return baselines.isEmpty() ? null : new ResultBaseline(List.copyOf(baselines));
+    }
+
+    /** Which pre-submit stamp, if any, the visible block still carries. */
+    private static String markerOn(Locator block, ResultBaseline baseline) {
+        for (BlockBaseline candidate : baseline.blocks()) {
+            if (countMarked(block, candidate.marker()) > 0) {
+                return candidate.marker();
+            }
+        }
+        return null;
     }
 
     /** Stamps the block and its status/timeline nodes; returns how many took it. */
@@ -922,6 +1090,11 @@ public class MscProbe implements MscTrackingClient {
             marked++;
         }
         for (Locator node : nodes(block, properties.getStatusSelector(), false)) {
+            if (markNode(node, marker)) {
+                marked++;
+            }
+        }
+        for (Locator node : nodes(block, properties.getSummarySelector(), false)) {
             if (markNode(node, marker)) {
                 marked++;
             }
@@ -1039,19 +1212,40 @@ public class MscProbe implements MscTrackingClient {
     }
 
     /**
-     * What the page showed for this container before the click: the stamp and
-     * how many nodes carry it, plus the visible facts to compare later.
+     * All pre-submit candidate blocks for this container, each with its own
+     * stamp and facts.
      */
-    private record ResultIdentity(String marker, int markedNodes, String status,
-                                  List<String> events) {
+    private record ResultBaseline(List<BlockBaseline> blocks) {
+        BlockBaseline forMarker(String marker) {
+            for (BlockBaseline block : blocks) {
+                if (block.marker().equals(marker)) {
+                    return block;
+                }
+            }
+            return null;
+        }
     }
 
-    /** A live read of the result block; {@code markedNodes} is -1 without a baseline. */
-    private record ResultObservation(String status, List<String> events, boolean ambiguous,
-                                     int markedNodes) {
+    /** One pre-submit block: its stamp, how many nodes took it, and its facts. */
+    private record BlockBaseline(String marker, int marked, ResultFacts facts) {
     }
 
-    private record ResultFacts(String status, List<String> events, boolean ambiguous) {
+    /**
+     * A live read of the result block. {@code blockText} is the exact text the
+     * parser will read, so ownership and parsing share one DOM read;
+     * {@code marker} is the pre-submit stamp the block still carries, or null
+     * when the page rebuilt it.
+     */
+    private record ResultObservation(String blockText, ResultFacts facts,
+                                     boolean ambiguous, String marker, int markedCount) {
+    }
+
+    /** The terminal state of the wait plus the read that satisfied it. */
+    private record WaitOutcome(WaitResult result, ResultObservation observation) {
+    }
+
+    private record ResultFacts(String status, List<String> events, Map<String, String> summary,
+                               List<List<String>> eventRows, boolean ambiguous) {
     }
 
     /**

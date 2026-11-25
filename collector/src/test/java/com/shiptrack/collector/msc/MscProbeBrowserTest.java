@@ -224,6 +224,57 @@ class MscProbeBrowserTest {
             </body></html>
             """;
 
+    /**
+     * The staged render from the sixth review: the tracking call answers 200,
+     * the page first drops an old timeline row, and only 900 ms later changes
+     * the status. Deleting a row must not be mistaken for a fresh result, or
+     * the probe would publish the old "picked up" status.
+     */
+    private static final String STAGED_RENDER_DROPS_ROW_FIRST = """
+            <html><body>
+            <form onsubmit="var c=document.getElementById('container').value;
+              fetch('/track-200?container='+c);
+              document.getElementById('old-row').remove();
+              setTimeout(function(){
+                document.getElementById('status').textContent='Status: Loaded on vessel';},900);
+              return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result">
+              <div>Container MSDU7172233</div>
+              <div id="status">Status: Container picked up</div>
+              <div class="event" id="old-row">Gate in - 2026-11-21 16:20 CET</div>
+              <div class="event">Loaded on vessel - 2026-11-22 08:00 UTC</div>
+            </div>
+            </body></html>
+            """;
+
+    /**
+     * Two pre-existing blocks for the same container. Submitting only swaps
+     * their visibility; no request is made and no content changes. The hidden
+     * "picked up" block is revealed, which must not count as a fresh result.
+     */
+    private static final String STAGED_REVEAL_SECOND_BLOCK = """
+            <html><body>
+            <form onsubmit="document.getElementById('block-a').style.display='none';
+              document.getElementById('block-b').style.display='block';return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result">
+              <div class="card" id="block-a">
+                <div>Container MSDU7172233</div>
+                <div class="status">Status: Loaded on vessel</div>
+              </div>
+              <div class="card" id="block-b" style="display:none">
+                <div>Container MSDU7172233</div>
+                <div class="status">Status: Container picked up</div>
+              </div>
+            </div>
+            </body></html>
+            """;
+
     /** A real render replaces the result nodes but leaves the status unchanged. */
     private static final String REAL_RENDER_SAME_STATUS = """
             <html><body>
@@ -241,6 +292,79 @@ class MscProbeBrowserTest {
               <div id="status">Status: Container picked up</div>
               <div id="updated">Updated 10:00:00</div>
             </div>
+            </body></html>
+            """;
+
+    /**
+     * The calibrated live card structure ({@code msc-flow-tracking__*}); the
+     * card is created on submit, as on the real page, so it is a genuine
+     * render of this query.
+     */
+    private static final String LIVE_STRUCTURE_PAGE = """
+            <html><body>
+            <form onsubmit="var t=document.getElementById('live-template');
+              document.getElementById('live-result').appendChild(t.content.cloneNode(true));return false;">
+              <input placeholder="Container number" name="trackingNumber">
+              <button type="submit">Track</button>
+            </form>
+            <div id="live-result"></div>
+            <template id="live-template">
+              <div class="msc-flow-tracking__container">
+                <div class="msc-flow-tracking__bar open">
+                  <div class="msc-flow-tracking__content">
+                    <div class="msc-flow-tracking__cell msc-flow-tracking__cell--one">
+                      <div class="msc-flow-tracking__data">
+                        <span class="data-heading">Container</span>
+                        <span class="data-value">MSDU7172233</span>
+                      </div>
+                    </div>
+                    <div class="msc-flow-tracking__cell msc-flow-tracking__cell--two">
+                      <div class="msc-flow-tracking__data">
+                        <span class="data-heading">Type</span>
+                        <span class="data-value">40' HIGH CUBE</span>
+                      </div>
+                    </div>
+                    <div class="msc-flow-tracking__cell msc-flow-tracking__cell--three">
+                      <div class="msc-flow-tracking__data">
+                        <span class="data-heading">Latest move</span>
+                        <span class="data-value">BUSAN, KR</span>
+                      </div>
+                    </div>
+                    <div class="msc-flow-tracking__cell msc-flow-tracking__cell--four">
+                      <div class="msc-flow-tracking__data">
+                        <span class="data-heading">POD ETA</span>
+                        <span class="data-value">07/12/2026</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="msc-flow-tracking__tracking">
+                  <div class="msc-flow-tracking__steps">
+                    <div class="msc-flow-tracking__port"><div class="msc-flow-tracking__step">
+                      <span class="data-value">07/12/2026</span>
+                      <span class="data-value">Vancouver,  CA</span>
+                      <span class="data-value">Estimated Time of Arrival</span>
+                      <span class="data-value">CAPE SOUNIO UK647R</span>
+                      <span class="data-value">Deltaport</span>
+                    </div></div>
+                    <div class="msc-flow-tracking__port"><div class="msc-flow-tracking__step">
+                      <span class="data-value">21/11/2026</span>
+                      <span class="data-value">Busan,  KR</span>
+                      <span class="data-value">Full Transshipment Loaded</span>
+                      <span class="data-value">CAPE SOUNIO UK643A</span>
+                      <span class="data-value">Hmm psa new-port terminal (hpnt)</span>
+                    </div></div>
+                    <div class="msc-flow-tracking__port"><div class="msc-flow-tracking__step">
+                      <span class="data-value">06/11/2026</span>
+                      <span class="data-value">Ningbo,  CN</span>
+                      <span class="data-value">Export Loaded on Vessel</span>
+                      <span class="data-value">MSC SOFIA GO643N</span>
+                      <span class="data-value">Gangji terminal (phase iv)</span>
+                    </div></div>
+                  </div>
+                </div>
+              </div>
+            </template>
             </body></html>
             """;
 
@@ -296,6 +420,34 @@ class MscProbeBrowserTest {
         if (server != null) {
             server.stop(0);
         }
+    }
+
+    @Test
+    void readsTheCalibratedLiveCardWithTheDefaultSelectors() {
+        MscProperties live = new MscProperties();
+        live.setBaseUrl(baseUrl("/live-structure"));
+        live.setQueryTimeoutMs(5_000);
+        live.setFormWaitMs(3_000);
+        live.setResultWaitMs(3_000);
+        live.setMinQueryIntervalMs(0);
+        live.setQueryJitterMs(0);
+        MscProbe liveProbe = new MscProbe(factory, live, new MscResultParser(live),
+                new MscErrorClassifier(live),
+                new QueryCircuitBreaker(100, Duration.ofSeconds(1), Clock.systemUTC()));
+
+        TrackingOutcome outcome = liveProbe.query("MSDU7172233");
+
+        assertThat(outcome).isInstanceOf(TrackingOutcome.Success.class);
+        ParsedTracking parsed = ((TrackingOutcome.Success) outcome).parsed();
+        assertThat(parsed.rawStatus()).isEqualTo("Full Transshipment Loaded");
+        assertThat(parsed.pol()).isEqualTo("Ningbo, CN");
+        assertThat(parsed.pod()).isEqualTo("Vancouver, CA");
+        assertThat(parsed.location()).isEqualTo("BUSAN, KR");
+        assertThat(parsed.etas()).singleElement().satisfies(eta -> {
+            assertThat(eta.milestone()).isEqualTo(
+                    com.shiptrack.contract.enums.TrackedMilestone.POD_ARRIVAL);
+            assertThat(eta.date()).isEqualTo(java.time.LocalDate.of(2026, 12, 7));
+        });
     }
 
     @Test
@@ -464,6 +616,29 @@ class MscProbeBrowserTest {
     }
 
     @Test
+    void doesNotPublishTheOldStatusWhenTheStagedRenderDropsARowFirst() {
+        properties.setQueryTimeoutMs(4_000);
+        properties.setResultWaitMs(3_000);
+        properties.setBaseUrl(baseUrl("/staged-row"));
+        TrackingOutcome outcome = probe.query("MSDU7172233");
+
+        assertThat(outcome).isInstanceOf(TrackingOutcome.Success.class);
+        assertThat(((TrackingOutcome.Success) outcome).parsed().rawStatus())
+                .contains("Loaded on vessel")
+                .doesNotContain("picked up");
+    }
+
+    @Test
+    void neverAdoptsAPreExistingBlockThatSubmitOnlyRevealed() {
+        properties.setQueryTimeoutMs(1_500);
+        properties.setResultWaitMs(700);
+        properties.setResultSelector(".card");
+        properties.setStatusSelector(".status");
+        properties.setBaseUrl(baseUrl("/staged-reveal"));
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
+    }
+
+    @Test
     void followsTheTrackingRedirectToItsFinal429() {
         properties.setBaseUrl(baseUrl("/redirect-429"));
         assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.RATE_LIMITED);
@@ -481,6 +656,7 @@ class MscProbeBrowserTest {
     private void dispatch(HttpExchange exchange) throws IOException {
         switch (exchange.getRequestURI().getPath()) {
             case "/ok" -> respond(exchange, 200, OK_PAGE);
+            case "/live-structure" -> respond(exchange, 200, LIVE_STRUCTURE_PAGE);
             case "/changed" -> respond(exchange, 200, CHANGED_PAGE);
             case "/captcha" -> respond(exchange, 200,
                     "<html><body><h1>Please verify you are human</h1></body></html>");
@@ -501,6 +677,8 @@ class MscProbeBrowserTest {
             case "/time-only" -> respond(exchange, 200, TIME_ONLY_UPDATE);
             case "/track-200-before-render" -> respond(exchange, 200, TRACK_200_BEFORE_RENDER);
             case "/real-render-same-status" -> respond(exchange, 200, REAL_RENDER_SAME_STATUS);
+            case "/staged-row" -> respond(exchange, 200, STAGED_RENDER_DROPS_ROW_FIRST);
+            case "/staged-reveal" -> respond(exchange, 200, STAGED_REVEAL_SECOND_BLOCK);
             case "/beacon" -> respond(exchange, 200, "{\"ok\":true}");
             case "/track-200" -> respond(exchange, 200, "{\"ok\":true}");
             case "/track-redirect" -> redirect(exchange, "/track-final");

@@ -49,12 +49,18 @@ collector:
     min-query-interval-ms: ${MSC_MIN_QUERY_INTERVAL_MS:500}
     query-jitter-ms: ${MSC_QUERY_JITTER_MS:1000}
     rate-limit-backoff-ms: ${MSC_RATE_LIMIT_BACKOFF_MS:30000}
-    # Selectors are provisional until the §13.1 live validation is done.
+    # Result-card selectors calibrated on 2026-11-25 against the live page
+    # (msc-flow-tracking__*); older selectors remain as fallbacks.
     container-input-selector: ${MSC_CONTAINER_INPUT_SELECTOR:input[name='trackingNumber'], input#trackingNumber, input[placeholder*='Container'], input[placeholder*='container']}
     submit-selector: ${MSC_SUBMIT_SELECTOR:button[type='submit'], button:has-text('Track')}
-    result-selector: ${MSC_RESULT_SELECTOR:[data-testid='tracking-result'], .tracking-result, .tracking-details, .shipment-details}
+    result-selector: ${MSC_RESULT_SELECTOR:.msc-flow-tracking__container, [data-testid='tracking-result'], .tracking-result, .tracking-details, .shipment-details}
     status-selector: ${MSC_STATUS_SELECTOR:[data-testid='status'], .tracking-status, .status-value, .shipment-status}
-    event-row-selector: ${MSC_EVENT_ROW_SELECTOR:[data-testid='event-row'], .timeline li, .tracking-events li, table tbody tr}
+    event-row-selector: ${MSC_EVENT_ROW_SELECTOR:.msc-flow-tracking__step, [data-testid='event-row'], .timeline li, .tracking-events li, table tbody tr}
+    summary-selector: ${MSC_SUMMARY_SELECTOR:.msc-flow-tracking__data}
+    summary-heading-selector: ${MSC_SUMMARY_HEADING_SELECTOR:.data-heading}
+    summary-value-selector: ${MSC_SUMMARY_VALUE_SELECTOR:.data-value}
+    # msc.com renders numeric dates day-first (07/12/2026 = 7 December).
+    day-first: ${MSC_DAY_FIRST:true}
 
   circuit-breaker:
     failure-threshold: ${COLLECTOR_CB_FAILURE_THRESHOLD:5}

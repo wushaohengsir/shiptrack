@@ -63,6 +63,14 @@ public class TrackingResultFactory {
                 || StatusWording.isCancelled(parsed.rawStatus())
                 ? TransportStatus.UNKNOWN
                 : mappings.normalize(carrier, parsed.rawStatus());
+        // Business red line: loading, discharge, transshipment or an empty-box
+        // movement must never stop tracking as a consignee pickup. The parser
+        // already derives such phrases verbatim; this guard keeps the rule
+        // even if the mapping file changes.
+        if (status == TransportStatus.PICKED_UP
+                && !StatusWording.isPickupEvidence(parsed.rawStatus())) {
+            status = TransportStatus.UNKNOWN;
+        }
 
         List<Eta> etas = new ArrayList<>();
         for (RawEta raw : parsed.etas()) {

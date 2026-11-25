@@ -9,9 +9,10 @@ import java.util.List;
  * Site-specific settings. Selectors are deliberately configuration, not code:
  * MSC changes page structure without notice and the fix must be a config edit.
  *
- * <p><b>Status:</b> the default selectors are a first-cut probe for the public
- * tracking page and have <i>not</i> been validated against the live site yet.
- * Requirement §13.1 gates that validation; see the M2 delivery notes.</p>
+ * <p><b>Status:</b> the result-card selectors were calibrated on 2026-11-25
+ * against the live page for container MSDU7172233. The saved fixture
+ * {@code msc_live_MSDU7172233_2026-11-25.html} is the reference for the real
+ * class names; older selectors are kept for compatibility.</p>
  */
 @ConfigurationProperties(prefix = "collector.msc")
 public class MscProperties {
@@ -25,14 +26,32 @@ public class MscProperties {
     private String submitSelector = "button[type='submit'], button:has-text('Track')";
 
     private String resultSelector =
-            "[data-testid='tracking-result'], .tracking-result, .tracking-details, "
-                    + ".shipment-details";
+            ".msc-flow-tracking__container, [data-testid='tracking-result'], "
+                    + ".tracking-result, .tracking-details, .shipment-details";
 
+    /**
+     * The live result card has no "Status:" label. This selector is kept for
+     * pages that do; when it matches nothing the parser derives the status
+     * from the latest move and the event table.
+     */
     private String statusSelector =
             "[data-testid='status'], .tracking-status, .status-value, .shipment-status";
 
     private String eventRowSelector =
-            "[data-testid='event-row'], .timeline li, .tracking-events li, table tbody tr";
+            ".msc-flow-tracking__step, [data-testid='event-row'], .timeline li, "
+                    + ".tracking-events li, table tbody tr";
+
+    /** One summary cell of the live card (heading + value). */
+    private String summarySelector = ".msc-flow-tracking__data";
+    private String summaryHeadingSelector = ".data-heading";
+    private String summaryValueSelector = ".data-value";
+
+    /**
+     * The tracking site renders numeric dates day-first ({@code 07/12/2026} is
+     * 7 December). The parser reads that order explicitly and drops a value
+     * that is impossible in it instead of guessing the other order.
+     */
+    private boolean dayFirst = true;
 
     /**
      * Path pattern of the carrier's real tracking call. Only a request whose
@@ -124,6 +143,38 @@ public class MscProperties {
 
     public void setEventRowSelector(String eventRowSelector) {
         this.eventRowSelector = eventRowSelector;
+    }
+
+    public String getSummarySelector() {
+        return summarySelector;
+    }
+
+    public void setSummarySelector(String summarySelector) {
+        this.summarySelector = summarySelector;
+    }
+
+    public String getSummaryHeadingSelector() {
+        return summaryHeadingSelector;
+    }
+
+    public void setSummaryHeadingSelector(String summaryHeadingSelector) {
+        this.summaryHeadingSelector = summaryHeadingSelector;
+    }
+
+    public String getSummaryValueSelector() {
+        return summaryValueSelector;
+    }
+
+    public void setSummaryValueSelector(String summaryValueSelector) {
+        this.summaryValueSelector = summaryValueSelector;
+    }
+
+    public boolean isDayFirst() {
+        return dayFirst;
+    }
+
+    public void setDayFirst(boolean dayFirst) {
+        this.dayFirst = dayFirst;
     }
 
     public String getTrackingUrlPattern() {

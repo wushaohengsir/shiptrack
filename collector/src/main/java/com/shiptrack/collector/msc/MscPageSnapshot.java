@@ -1,6 +1,10 @@
 package com.shiptrack.collector.msc;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Raw, untyped view of one loaded tracking page. Capture is browser-bound;
@@ -24,11 +28,29 @@ public record MscPageSnapshot(
         List<String> eventLines,
         boolean passwordFieldPresent,
         String resultBlockText,
-        boolean resultAmbiguous
+        boolean resultAmbiguous,
+        Map<String, String> summaryFacts,
+        List<List<String>> eventRows
 ) {
 
     public MscPageSnapshot {
         eventLines = eventLines == null ? List.of() : List.copyOf(eventLines);
+        summaryFacts = summaryFacts == null
+                ? Map.of()
+                : Collections.unmodifiableMap(new LinkedHashMap<>(summaryFacts));
+        eventRows = eventRows == null ? List.of() : immutableRows(eventRows);
+    }
+
+    public MscPageSnapshot(String title,
+                           String url,
+                           String bodyText,
+                           String statusText,
+                           List<String> eventLines,
+                           boolean passwordFieldPresent,
+                           String resultBlockText,
+                           boolean resultAmbiguous) {
+        this(title, url, bodyText, statusText, eventLines, passwordFieldPresent,
+                resultBlockText, resultAmbiguous, Map.of(), List.of());
     }
 
     public MscPageSnapshot(String title,
@@ -38,7 +60,8 @@ public record MscPageSnapshot(
                            List<String> eventLines,
                            boolean passwordFieldPresent,
                            String resultBlockText) {
-        this(title, url, bodyText, statusText, eventLines, passwordFieldPresent, resultBlockText, false);
+        this(title, url, bodyText, statusText, eventLines, passwordFieldPresent,
+                resultBlockText, false, Map.of(), List.of());
     }
 
     /** Snapshot without a scoped result block (classifiers and legacy callers). */
@@ -48,6 +71,15 @@ public record MscPageSnapshot(
                            String statusText,
                            List<String> eventLines,
                            boolean passwordFieldPresent) {
-        this(title, url, bodyText, statusText, eventLines, passwordFieldPresent, null, false);
+        this(title, url, bodyText, statusText, eventLines, passwordFieldPresent,
+                null, false, Map.of(), List.of());
+    }
+
+    private static List<List<String>> immutableRows(List<List<String>> rows) {
+        List<List<String>> copy = new ArrayList<>(rows.size());
+        for (List<String> row : rows) {
+            copy.add(row == null ? List.of() : List.copyOf(row));
+        }
+        return List.copyOf(copy);
     }
 }

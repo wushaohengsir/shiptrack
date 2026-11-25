@@ -1,6 +1,7 @@
 package com.shiptrack.collector.msc;
 
 import com.shiptrack.contract.enums.TrackedMilestone;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDate;
@@ -95,9 +96,39 @@ public final class MscResultParser {
      * separate statement: the port in one field does not qualify the date in
      * another, and a date in the discharge field is not the POD arrival.
      */
-    private static final Pattern FIELD_SEPARATOR = Pattern.compile("\\s*[|;•]\\s*");
+    private static final Pattern FIELD_SEPARATOR = Pattern.compile(
+            "\\s*(?:[|;•]|[—–])\\s*|\\s+-\\s+");
+
+    /**
+     * "Expected arrival at Seattle" binds the date to Seattle. When the
+     * monitored node is known and names another city, the field is dropped
+     * instead of borrowing the row's POD label. The place capture never spans
+     * a date, so the date stays outside the captured text.
+     */
+    private static final Pattern ARRIVAL_PLACE = Pattern.compile(
+            "(?i)\\b(?:arrival|arrive[ds]?|arriving|eta|expected\\s+arrival|"
+                    + "estimated\\s+(?:time\\s+of\\s+)?arrival)\\b"
+                    + "[^\\d|;•—–]{0,40}?\\b(?:at|to|in)\\s+([\\p{L}][\\p{L} .'-]{1,40})");
 
     private static final int MAX_RAW_VALUE = 200;
+
+    private final EtaTextParser.DateOrder dateOrder;
+
+    /** Defaults to the MSC site's day-first numeric dates. */
+    public MscResultParser() {
+        this(EtaTextParser.DateOrder.DAY_FIRST);
+    }
+
+    @Autowired
+    public MscResultParser(MscProperties properties) {
+        this(properties.isDayFirst()
+                ? EtaTextParser.DateOrder.DAY_FIRST
+                : EtaTextParser.DateOrder.MONTH_FIRST);
+    }
+
+    MscResultParser(EtaTextParser.DateOrder dateOrder) {
+        this.dateOrder = dateOrder == null ? EtaTextParser.DateOrder.DAY_FIRST : dateOrder;
+    }
 
     public ParsedTracking parse(MscPageSnapshot snapshot, String containerNo) {
         // Only the result block this query produced may be read. The whole page
@@ -114,8 +145,14 @@ public final class MscResultParser {
         }
         requireExactlyOneContainer(block, containerNo);
 
+        FlowTracking flow = FlowTracking.from(
+                snapshot.summaryFacts(), snapshot.eventRows(), dateOrder).orElse(null);
+
         List<String> statusLines = matches(STATUS_LINE, block);
         String rawStatus = snapshot.statusText();
+        if (rawStatus == null || rawStatus.isBlank()) {
+            rawStatus = summaryStatus(snapshot.summaryFacts());
+        }
         if (rawStatus == null || rawStatus.isBlank()) {
             // Without a visible status element, the block itself must be
             // unambiguous: two different status values mean ownership of the
@@ -126,6 +163,11 @@ public final class MscResultParser {
             }
             rawStatus = statusLines.isEmpty() ? null : statusLines.getFirst();
         }
+        if ((rawStatus == null || rawStatus.isBlank()) && flow != null) {
+            // The live card prints no Status: field; derive it from the
+            // newest event that actually happened, never from a plan.
+            rawStatus = flow.derivedStatus();
+        }
         if (rawStatus == null || rawStatus.isBlank()) {
             throw new MscParseException("no status text found for container " + containerNo);
         }
@@ -134,31 +176,71 @@ public final class MscResultParser {
         String pol = match(POL, block);
         String pod = match(POD, block);
         String finalDestination = match(FINAL_DESTINATION, block);
-
-        List<RawEvent> events = new ArrayList<>();
-        for (String line : snapshot.eventLines()) {
-            String trimmed = line == null ? "" : line.trim();
-            if (trimmed.isEmpty()) {
-                continue;
-            }
-            Optional<EtaTextParser.ZonedTime> time = EtaTextParser.parseTime(trimmed);
-            events.add(new RawEvent(
-                    trimmed,
-                    StatusWording.eventTimeType(trimmed),
-                    EtaTextParser.parseDateTime(trimmed).orElse(null),
-                    time.map(EtaTextParser.ZonedTime::timezone).orElse(null)));
+        String location = match(LOCATION, block);
+        if (flow != null) {
+            // Explicit labeled fields win; the structured card fills the gaps.
+            pol = pol != null ? pol : flow.pol();
+            pod = pod != null ? pod : flow.pod();
+            finalDestination = finalDestination != null ? finalDestination : flow.finalDestination();
+            location = location != null ? location : flow.latestMove();
         }
 
+        List<RawEvent> events = new ArrayList<>();
+        if (flow != null && !flow.events().isEmpty()) {
+            for (FlowTracking.FlowEvent event : flow.events()) {
+                events.add(new RawEvent(
+                        event.rawText(),
+                        event.eventTimeType(),
+                        event.occurredAt(),
+                        event.timezone()));
+            }
+        } else {
+            for (String line : snapshot.eventLines()) {
+                String trimmed = line == null ? "" : line.trim();
+                if (trimmed.isEmpty()) {
+                    continue;
+                }
+                Optional<EtaTextParser.ZonedTime> time = EtaTextParser.parseTime(trimmed);
+                events.add(new RawEvent(
+                        trimmed,
+                        StatusWording.eventTimeType(trimmed),
+                        EtaTextParser.parseDateTime(trimmed, dateOrder).orElse(null),
+                        time.map(EtaTextParser.ZonedTime::timezone).orElse(null)));
+            }
+        }
+
+        List<RawEta> structuredEtas = flow == null ? List.of() : flow.etas();
         return new ParsedTracking(
                 rawStatus,
-                match(LOCATION, block),
+                location,
                 match(VESSEL, block),
                 match(VOYAGE, block),
                 pol,
                 pod,
                 finalDestination,
-                parseEtas(block, snapshot.eventLines(), pod, finalDestination),
+                parseEtas(block, snapshot.eventLines(), pod, finalDestination, structuredEtas),
                 events);
+    }
+
+    /**
+     * A status label can also be printed as a summary heading/value pair.
+     * Only an explicit heading counts; "Latest move" is a location.
+     */
+    private static String summaryStatus(Map<String, String> summary) {
+        if (summary == null || summary.isEmpty()) {
+            return null;
+        }
+        for (Map.Entry<String, String> entry : summary.entrySet()) {
+            String heading = entry.getKey() == null
+                    ? ""
+                    : entry.getKey().trim().replaceAll("\\s+", " ").toLowerCase(Locale.ROOT);
+            if (heading.equals("status") || heading.equals("shipment status")
+                    || heading.equals("current status")) {
+                String value = entry.getValue();
+                return value == null || value.isBlank() ? null : value.trim();
+            }
+        }
+        return null;
     }
 
     /**
@@ -167,13 +249,25 @@ public final class MscResultParser {
      * is dropped instead of being guessed as the POD arrival.
      */
     private List<RawEta> parseEtas(String body, List<String> eventLines,
-                                   String pod, String finalDestination) {
+                                   String pod, String finalDestination,
+                                   List<RawEta> structuredEtas) {
         List<String> candidates = new ArrayList<>();
         body.lines().forEach(candidates::add);
         candidates.addAll(eventLines);
 
         Map<TrackedMilestone, RawEta> chosen = new LinkedHashMap<>();
         Set<TrackedMilestone> conflicting = new HashSet<>();
+
+        // The calibrated summary and event table are already bound to their
+        // node; the text pass below can only add nodes they did not cover.
+        if (structuredEtas != null) {
+            for (RawEta eta : structuredEtas) {
+                RawEta existing = chosen.putIfAbsent(eta.milestone(), eta);
+                if (existing != null && !sameEta(existing, eta)) {
+                    conflicting.add(eta.milestone());
+                }
+            }
+        }
 
         for (String candidate : candidates) {
             // Bind the arrival place and the date to the same field, not to
@@ -214,8 +308,8 @@ public final class MscResultParser {
      * date and name the monitored node. A field that names another port is
      * dropped instead of borrowing the row's POD field.
      */
-    private static Optional<RawEta> etaFromClause(String candidate, String pod,
-                                                  String finalDestination) {
+    private Optional<RawEta> etaFromClause(String candidate, String pod,
+                                           String finalDestination) {
         String line = candidate == null ? "" : candidate.trim();
         if (line.isEmpty() || !ETA_HINT.matcher(line).find()) {
             return Optional.empty();
@@ -223,12 +317,18 @@ public final class MscResultParser {
         if (!isArrivalForecast(line)) {
             return Optional.empty();
         }
+        // A field that names another arrival city cannot borrow the monitored
+        // node's label. When neither node is known the remaining checks still
+        // have to find an explicit POD/final-destination mention.
+        if (namesAnotherArrivalPlace(line, pod, finalDestination)) {
+            return Optional.empty();
+        }
         // Two dates in one field: the estimate cannot be bound to one value
         // without guessing.
         if (EtaTextParser.dateOccurrences(line) != 1) {
             return Optional.empty();
         }
-        Optional<LocalDate> date = EtaTextParser.parseDate(line);
+        Optional<LocalDate> date = EtaTextParser.parseDate(line, dateOrder);
         Optional<TrackedMilestone> milestone = etaMilestone(line, pod, finalDestination);
         if (date.isEmpty() || milestone.isEmpty()) {
             return Optional.empty();
@@ -265,6 +365,47 @@ public final class MscResultParser {
             return false;
         }
         return ARRIVAL_WORDING.matcher(line).find();
+    }
+
+    /**
+     * True when the field explicitly places the arrival at a city that is
+     * neither the monitored port nor the final destination. Only used when one
+     * of those is known; otherwise the field is left to the POD/final mention
+     * checks below, which already require an explicit binding.
+     */
+    private static boolean namesAnotherArrivalPlace(String line, String pod, String finalDestination) {
+        if (pod == null && finalDestination == null) {
+            return false;
+        }
+        Matcher matcher = ARRIVAL_PLACE.matcher(line);
+        while (matcher.find()) {
+            String place = matcher.group(1).trim().replaceAll("[\\s.,]+$", "");
+            if (place.length() < 3 || isNodeLabel(place)) {
+                continue;
+            }
+            if (sameCity(place, pod) || sameCity(place, finalDestination)) {
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /** Labels that stand for the monitored node itself, not another city. */
+    private static boolean isNodeLabel(String place) {
+        String value = place.toLowerCase(Locale.ROOT).replaceAll("\\s+", " ");
+        return value.equals("pod") || value.startsWith("pod ")
+                || value.equals("port of discharge") || value.equals("discharge port")
+                || value.equals("port") || value.equals("the port")
+                || value.equals("destination") || value.equals("final destination")
+                || value.equals("terminal");
+    }
+
+    private static boolean sameCity(String left, String right) {
+        if (right == null || right.isBlank()) {
+            return false;
+        }
+        return left.split(",")[0].trim().equalsIgnoreCase(right.split(",")[0].trim());
     }
 
     private static Optional<TrackedMilestone> etaMilestone(String line, String pod, String finalDestination) {

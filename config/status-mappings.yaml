@@ -16,11 +16,20 @@
 # The MSC phrases below are the first cut for the M2 probe. They must be
 # confirmed against the live page during the §13.1 validation; until then this
 # list only covers wording the requirements already quote.
-version: 2
-updated_at: "2026-11-24T22:10:00+08:00"
+# v3 adds the phrases the calibrated live card actually prints ("Export
+# received at CY", "Empty to Shipper", "Full Transshipment Positioned",
+# "Import full gate out") plus a generic in-transit fallback used only when a
+# page shows no classifiable event. None of these may map to PICKED_UP; the
+# reporter additionally refuses PICKED_UP without explicit pickup evidence.
+version: 3
+updated_at: "2026-11-25T19:40:00+08:00"
 mappings:
   - carrier: MSC
     match: "Empty container released"
+    transport_status: EMPTY_RELEASED
+    priority: 60
+  - carrier: MSC
+    match: "Empty to Shipper"
     transport_status: EMPTY_RELEASED
     priority: 60
   - carrier: MSC
@@ -33,6 +42,10 @@ mappings:
     priority: 100
   - carrier: MSC
     match: "Gate in"
+    transport_status: GATE_IN
+    priority: 70
+  - carrier: MSC
+    match: "Export received at CY"
     transport_status: GATE_IN
     priority: 70
   - carrier: MSC
@@ -52,6 +65,10 @@ mappings:
     transport_status: TRANSSHIP_LOADED
     priority: 75
   - carrier: MSC
+    match: "Full Transshipment Positioned"
+    transport_status: WAITING_TRANSSHIP
+    priority: 76
+  - carrier: MSC
     match: "Arrived at port of discharge"
     transport_status: ARRIVED_POD
     priority: 85
@@ -68,6 +85,16 @@ mappings:
     transport_status: PICKED_UP
     priority: 90
   - carrier: MSC
+    match: "Import full gate out"
+    transport_status: PICKED_UP
+    priority: 90
+  - carrier: MSC
     match: "Empty container returned"
     transport_status: EMPTY_RETURNED
     priority: 95
+  # Used only when a page shows no classifiable event. "DEPARTED" is the
+  # stage-3 in-transit state; it never stops tracking.
+  - carrier: MSC
+    match: "In transit"
+    transport_status: DEPARTED
+    priority: 20

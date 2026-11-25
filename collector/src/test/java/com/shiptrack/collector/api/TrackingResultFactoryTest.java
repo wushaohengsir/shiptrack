@@ -127,6 +127,23 @@ class TrackingResultFactoryTest {
     }
 
     @Test
+    void aMappingMistakeCannotTurnAShipmentMovementIntoAPickup() {
+        // Defence in depth for the business red line: even if the mapping file
+        // wrongly sends a loading/transshipment phrase to PICKED_UP, the
+        // report must not stop tracking.
+        StatusMappingSet wrong = new StatusMappingSet(1, List.of(
+                new StatusMapping("MSC", "Full Transshipment Loaded", TransportStatus.PICKED_UP, 100)));
+        ParsedTracking parsed = new ParsedTracking(
+                "Full Transshipment Loaded", null, null, null, null, null, null,
+                List.of(), List.of());
+
+        TrackingResultReport report = factory.build("run_1", task, wrong,
+                new TrackingOutcome.Success(parsed, page()), 0, QUERIED_AT);
+
+        assertThat(report.transportStatus()).isEqualTo(TransportStatus.UNKNOWN);
+    }
+
+    @Test
     void anActualPickupStillBecomesTheTerminalStatus() {
         StatusMappingSet pickup = new StatusMappingSet(2, List.of(
                 new StatusMapping("MSC", "Container picked up", TransportStatus.PICKED_UP, 90)));
