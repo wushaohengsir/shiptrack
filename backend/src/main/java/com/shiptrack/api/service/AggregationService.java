@@ -283,7 +283,23 @@ public class AggregationService {
         return Duration.between(from, to).toHours();
     }
 
+    /**
+     * §7.1/§3.3: a DATETIME ETA already carries the resolved instant in
+     * {@code utc_at}, so comparing that avoids the DST ambiguity of turning a
+     * local wall clock back into UTC (a repeated hour has two valid offsets).
+     * The date/time/timezone reconstruction is used only when {@code utc_at} is
+     * absent; a present-but-unparseable {@code utc_at} yields no hours and the
+     * caller falls back to whole natural days instead of guessing an offset.
+     */
     private java.time.Instant instantOf(Map<String, Object> value) {
+        String utcAt = text(value, "utc_at");
+        if (utcAt != null && !utcAt.isBlank()) {
+            try {
+                return java.time.Instant.parse(utcAt);
+            } catch (RuntimeException ignored) {
+                return null;
+            }
+        }
         String date = text(value, "date");
         String time = text(value, "time");
         String zone = text(value, "timezone");

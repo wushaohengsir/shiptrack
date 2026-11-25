@@ -424,6 +424,43 @@ class NotificationIntegrationTest {
     }
 
     @Test
+    void etaDeltaUsesUtcAtAcrossTheDstFallBackOverlap() throws Exception {
+        BODIES.clear();
+        Map<String, Object> order = createOrder("PO-IT-ETA-DST");
+        long orderId = ((Number) order.get("id")).longValue();
+        long containerId = firstContainerId(order);
+
+        // America/Vancouver falls back on 2026-11-01: 01:30 local happens twice,
+        // at 08:30Z (PDT) and 09:30Z (PST). The first ETA is the second 01:30
+        // (09:30Z); the second ETA is 01:30 the next day (2026-11-02T09:30Z).
+        // Their utc_at differ by 24 hours, but rebuilding the first instant from
+        // its wall clock picks the earlier PDT offset (08:30Z), which would make
+        // "较上次" 25 hours and disagree with the 24-hour baseline delta.
+        String run1 = refreshContainer(containerId);
+        report(run1, containerId, (String) claim(run1).get("claim_token"),
+                dateTimeEta("2026-11-01", "01:30", "America/Vancouver",
+                        "2026-11-01T09:30:00Z"),
+                List.of(loadedEvent()), "DEPARTED");
+        String run2 = refreshContainer(containerId);
+        Map<String, Object> reportBody = report(run2, containerId,
+                (String) claim(run2).get("claim_token"),
+                dateTimeEta("2026-11-02", "01:30", "America/Vancouver",
+                        "2026-11-02T09:30:00Z"),
+                List.of(loadedEvent()), "DEPARTED");
+        assertEquals("created",
+                ((Map<?, ?>) reportBody.get("order_notification")).get("state"));
+        String key = "order:" + orderId + ":run:" + run2 + ":channel:feishu";
+
+        assertTrue(dispatcher.dispatchOnce() >= 1);
+        String text = sentText(key);
+        assertTrue(text.contains("到港 2026-11-01 01:30 → 2026-11-02 01:30"), text);
+        assertTrue(text.contains("较上次推迟 24 小时"), text);
+        assertTrue(text.contains("较基线累计推迟 24 小时"), text);
+        assertFalse(text.contains("较上次推迟 25 小时"),
+                "the ambiguous local time must not shift the delta: " + text);
+    }
+
+    @Test
     void arrivalDateComesFromTheActualTrajectory() throws Exception {
         BODIES.clear();
         Map<String, Object> order = createOrder("PO-IT-ARRIVAL-DATE");
