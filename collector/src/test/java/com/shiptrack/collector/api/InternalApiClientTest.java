@@ -15,8 +15,10 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import javax.net.ssl.SSLSocketFactory;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
@@ -153,6 +155,36 @@ class InternalApiClientTest {
         long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
 
         assertThat(elapsedMs).isLessThan(650L);
+    }
+
+    @Test
+    void boundsHostResolutionInsideTheLeaseBudgetAndSendsNothing() {
+        CollectorProperties properties = new CollectorProperties();
+        properties.setBaseUrl("http://slow.invalid:" + server.getAddress().getPort());
+        properties.setInternalToken("secret-token");
+        InternalApiClient slowClient = new InternalApiClient(properties,
+                (SSLSocketFactory) SSLSocketFactory.getDefault(),
+                host -> {
+                    // A resolver that outlives the lease: the caller must still
+                    // return on time and discard the late address.
+                    try {
+                        Thread.sleep(1_000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return InetAddress.getByName("127.0.0.1");
+                });
+
+        long startedAt = System.nanoTime();
+        assertThatThrownBy(() -> slowClient.report(sampleReport(), 200))
+                .isInstanceOf(org.springframework.web.client.RestClientException.class)
+                .hasMessageContaining("did not finish");
+        long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
+
+        assertThat(elapsedMs).isLessThan(800L);
+        assertThat(reportBody.get())
+                .as("a lookup that finishes late must not be used to send")
+                .isNull();
     }
 
     @Test

@@ -90,6 +90,13 @@ public final class MscResultParser {
     private static final Pattern CONTAINER_TOKEN = Pattern.compile(
             "(?i)\\b([A-Z]{4}\\d{7})\\b");
 
+    /**
+     * A rendered row can print several fields side by side. Each field is a
+     * separate statement: the port in one field does not qualify the date in
+     * another, and a date in the discharge field is not the POD arrival.
+     */
+    private static final Pattern FIELD_SEPARATOR = Pattern.compile("\\s*[|;•]\\s*");
+
     private static final int MAX_RAW_VALUE = 200;
 
     public ParsedTracking parse(MscPageSnapshot snapshot, String containerNo) {
@@ -169,41 +176,71 @@ public final class MscResultParser {
         Set<TrackedMilestone> conflicting = new HashSet<>();
 
         for (String candidate : candidates) {
-            String line = candidate == null ? "" : candidate.trim();
-            if (line.isEmpty() || !ETA_HINT.matcher(line).find()) {
-                continue;
-            }
-            if (!isArrivalForecast(line)) {
-                continue;
-            }
-            // Two dates on one line: the estimate cannot be bound to one value
-            // without guessing.
-            if (EtaTextParser.dateOccurrences(line) != 1) {
-                continue;
-            }
-            Optional<LocalDate> date = EtaTextParser.parseDate(line);
-            Optional<TrackedMilestone> milestone = etaMilestone(line, pod, finalDestination);
-            if (date.isEmpty() || milestone.isEmpty()) {
-                continue;
-            }
-            String rawValue = line.length() > MAX_RAW_VALUE ? line.substring(0, MAX_RAW_VALUE) : line;
-            Optional<EtaTextParser.ZonedTime> time = EtaTextParser.parseTime(line);
-            RawEta eta = new RawEta(
-                    milestone.get(),
-                    rawValue,
-                    date.get(),
-                    time.map(EtaTextParser.ZonedTime::time).orElse(null),
-                    time.map(EtaTextParser.ZonedTime::timezone).orElse(null));
-
-            RawEta existing = chosen.putIfAbsent(milestone.get(), eta);
-            if (existing != null && !sameEta(existing, eta)) {
-                // Two different values for one node: publish neither rather
-                // than guessing which is current.
-                conflicting.add(milestone.get());
+            // Bind the arrival place and the date to the same field, not to
+            // other fields printed on the same row.
+            for (String clause : splitClauses(candidate)) {
+                Optional<RawEta> eta = etaFromClause(clause, pod, finalDestination);
+                if (eta.isEmpty()) {
+                    continue;
+                }
+                TrackedMilestone milestone = eta.get().milestone();
+                RawEta existing = chosen.putIfAbsent(milestone, eta.get());
+                if (existing != null && !sameEta(existing, eta.get())) {
+                    // Two different values for one node: publish neither rather
+                    // than guessing which is current.
+                    conflicting.add(milestone);
+                }
             }
         }
         conflicting.forEach(chosen::remove);
         return new ArrayList<>(chosen.values());
+    }
+
+    private static List<String> splitClauses(String candidate) {
+        if (candidate == null) {
+            return List.of();
+        }
+        List<String> clauses = new ArrayList<>();
+        for (String part : FIELD_SEPARATOR.split(candidate)) {
+            if (!part.isBlank()) {
+                clauses.add(part);
+            }
+        }
+        return clauses;
+    }
+
+    /**
+     * One field of a row. The field must itself forecast an arrival, print one
+     * date and name the monitored node. A field that names another port is
+     * dropped instead of borrowing the row's POD field.
+     */
+    private static Optional<RawEta> etaFromClause(String candidate, String pod,
+                                                  String finalDestination) {
+        String line = candidate == null ? "" : candidate.trim();
+        if (line.isEmpty() || !ETA_HINT.matcher(line).find()) {
+            return Optional.empty();
+        }
+        if (!isArrivalForecast(line)) {
+            return Optional.empty();
+        }
+        // Two dates in one field: the estimate cannot be bound to one value
+        // without guessing.
+        if (EtaTextParser.dateOccurrences(line) != 1) {
+            return Optional.empty();
+        }
+        Optional<LocalDate> date = EtaTextParser.parseDate(line);
+        Optional<TrackedMilestone> milestone = etaMilestone(line, pod, finalDestination);
+        if (date.isEmpty() || milestone.isEmpty()) {
+            return Optional.empty();
+        }
+        String rawValue = line.length() > MAX_RAW_VALUE ? line.substring(0, MAX_RAW_VALUE) : line;
+        Optional<EtaTextParser.ZonedTime> time = EtaTextParser.parseTime(line);
+        return Optional.of(new RawEta(
+                milestone.get(),
+                rawValue,
+                date.get(),
+                time.map(EtaTextParser.ZonedTime::time).orElse(null),
+                time.map(EtaTextParser.ZonedTime::timezone).orElse(null)));
     }
 
     /**

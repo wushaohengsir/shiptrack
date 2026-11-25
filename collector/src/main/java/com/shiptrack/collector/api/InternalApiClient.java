@@ -10,6 +10,7 @@ import com.shiptrack.contract.internal.TrackingRunDto;
 import com.shiptrack.contract.internal.TrackingRunsResponse;
 import com.shiptrack.contract.internal.TrackingTaskClaimRequest;
 import com.shiptrack.contract.internal.TrackingTaskClaimResponse;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
@@ -18,6 +19,7 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestClientResponseException;
 
+import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import java.io.BufferedInputStream;
@@ -27,6 +29,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
@@ -38,10 +41,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Minimal client for the two internal endpoints. It holds no database
@@ -55,6 +62,13 @@ public class InternalApiClient implements CollectorApi {
     private static final int MAX_HEADER_LINE = 8_192;
     private static final int MAX_HEADER_COUNT = 100;
 
+    /** Host lookups run here so a slow DNS server cannot outlive the lease. */
+    private static final ExecutorService DNS_EXECUTOR = Executors.newCachedThreadPool(runnable -> {
+        Thread thread = new Thread(runnable, "report-dns");
+        thread.setDaemon(true);
+        return thread;
+    });
+
     private final RestClient.Builder builder;
     private final int connectTimeoutMs;
     private final int readTimeoutMs;
@@ -62,8 +76,18 @@ public class InternalApiClient implements CollectorApi {
     private final URI baseUri;
     private final String internalToken;
     private final ObjectMapper objectMapper;
+    private final SSLSocketFactory sslSocketFactory;
+    private final HostResolver hostResolver;
 
+    @Autowired
     public InternalApiClient(CollectorProperties properties) {
+        this(properties, (SSLSocketFactory) SSLSocketFactory.getDefault(),
+                InternalApiClient::defaultResolve);
+    }
+
+    /** Overridable collaborators so TLS identity and DNS cost can be tested. */
+    InternalApiClient(CollectorProperties properties, SSLSocketFactory sslSocketFactory,
+                      HostResolver hostResolver) {
         this.connectTimeoutMs = properties.getConnectTimeoutMs();
         this.readTimeoutMs = properties.getReadTimeoutMs();
         this.baseUri = URI.create(trimTrailingSlash(properties.getBaseUrl()));
@@ -72,11 +96,22 @@ public class InternalApiClient implements CollectorApi {
             throw new IllegalArgumentException("internal token must not contain line breaks");
         }
         this.objectMapper = defaultMapper();
+        this.sslSocketFactory = sslSocketFactory;
+        this.hostResolver = hostResolver;
         this.builder = RestClient.builder()
                 .baseUrl(baseUri.toString())
                 .defaultHeader("X-Internal-Token", internalToken)
                 .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE);
         this.restClient = client(properties.getReadTimeoutMs());
+    }
+
+    @FunctionalInterface
+    interface HostResolver {
+        InetAddress resolve(String host) throws IOException;
+    }
+
+    private static InetAddress defaultResolve(String host) throws IOException {
+        return InetAddress.getByName(host);
     }
 
     /**
@@ -122,17 +157,29 @@ public class InternalApiClient implements CollectorApi {
 
             boolean tls = "https".equalsIgnoreCase(baseUri.getScheme());
             int port = baseUri.getPort() >= 0 ? baseUri.getPort() : (tls ? 443 : 80);
-            socket.connect(new InetSocketAddress(baseUri.getHost(), port),
-                    Math.max(1, effectiveConnect));
-            socket.setSoTimeout(Math.max(1, effectiveRead));
+            // Residence time is part of the absolute budget: a DNS server that
+            // is slower than the lease must not delay the caller past it.
+            InetSocketAddress endpoint = resolve(baseUri.getHost(), port, deadlineNanos, timeoutMs);
+            ensureRemaining(deadlineNanos, timeoutMs);
+            socket.connect(endpoint,
+                    Math.max(1, (int) Math.min(effectiveConnect, remainingMs(deadlineNanos))));
+            ensureRemaining(deadlineNanos, timeoutMs);
+            socket.setSoTimeout(Math.max(1, (int) Math.min(effectiveRead, remainingMs(deadlineNanos))));
             Socket channel = socket;
             if (tls) {
-                SSLSocket ssl = (SSLSocket) ((SSLSocketFactory) SSLSocketFactory.getDefault())
+                SSLSocket ssl = (SSLSocket) sslSocketFactory
                         .createSocket(socket, baseUri.getHost(), port, true);
+                // The raw socket would otherwise skip HTTPS endpoint identity
+                // checks and send the internal token to any trusted hostname.
+                SSLParameters parameters = ssl.getSSLParameters();
+                parameters.setEndpointIdentificationAlgorithm("HTTPS");
+                ssl.setSSLParameters(parameters);
                 ssl.startHandshake();
+                ensureRemaining(deadlineNanos, timeoutMs);
                 channel = ssl;
             }
 
+            ensureRemaining(deadlineNanos, timeoutMs);
             writeRequest(channel, port, tls, body);
             Reply reply = readReply(channel);
             if (reply.status() >= 400) {
@@ -161,6 +208,51 @@ public class InternalApiClient implements CollectorApi {
                 watchdog.shutdownNow();
             }
             closeQuietly(socket);
+        }
+    }
+
+    /**
+     * Resolves the API host on a worker and waits no longer than the lease
+     * leaves. A lookup that finishes after the deadline is discarded, so the
+     * caller returns on time even when the resolver never does.
+     */
+    private InetSocketAddress resolve(String host, int port, long deadlineNanos, long timeoutMs)
+            throws IOException {
+        if (host == null || host.isBlank()) {
+            throw new IOException("collector base URL has no host");
+        }
+        long remaining = remainingMs(deadlineNanos);
+        if (remaining <= 0) {
+            throw new SocketTimeoutException("report had no time left for host resolution");
+        }
+        Future<InetAddress> lookup = DNS_EXECUTOR.submit(() -> hostResolver.resolve(host));
+        try {
+            InetAddress address = lookup.get(Math.max(1, remaining), TimeUnit.MILLISECONDS);
+            if (remainingMs(deadlineNanos) <= 0) {
+                lookup.cancel(true);
+                throw new SocketTimeoutException("report host resolution outlived its budget");
+            }
+            return new InetSocketAddress(address, port);
+        } catch (TimeoutException e) {
+            lookup.cancel(true);
+            throw new SocketTimeoutException("report host resolution exceeded " + timeoutMs + "ms");
+        } catch (InterruptedException e) {
+            lookup.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new SocketTimeoutException("report host resolution was interrupted");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException io) {
+                throw io;
+            }
+            throw new IOException("report host resolution failed: " + cause, cause);
+        }
+    }
+
+    private static void ensureRemaining(long deadlineNanos, long timeoutMs)
+            throws SocketTimeoutException {
+        if (remainingMs(deadlineNanos) <= 0) {
+            throw new SocketTimeoutException("report did not finish within " + timeoutMs + "ms");
         }
     }
 

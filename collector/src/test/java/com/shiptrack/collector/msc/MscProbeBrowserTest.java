@@ -176,6 +176,74 @@ class MscProbeBrowserTest {
             </body></html>
             """;
 
+    /** A same-container analytics beacon answers 200 while the old result stays. */
+    private static final String BEACON_200_WITH_STALE_RESULT = """
+            <html><body>
+            <form onsubmit="var c=document.getElementById('container').value;
+              fetch('/beacon?container='+c);return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result">
+              <div>Container MSDU7172233</div>
+              <div id="status">Status: Container picked up</div>
+            </div>
+            </body></html>
+            """;
+
+    /** Only an unrelated clock label inside the result block changes after submit. */
+    private static final String TIME_ONLY_UPDATE = """
+            <html><body>
+            <form onsubmit="document.getElementById('updated').textContent='Updated 10:00:01';return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result">
+              <div>Container MSDU7172233</div>
+              <div id="status">Status: Container picked up</div>
+              <div id="updated">Updated 10:00:00</div>
+            </div>
+            </body></html>
+            """;
+
+    /** The tracking call answers 200 at once; the real render comes 700 ms later. */
+    private static final String TRACK_200_BEFORE_RENDER = """
+            <html><body>
+            <form onsubmit="var c=document.getElementById('container').value;
+              fetch('/track-200?container='+c);
+              setTimeout(function(){
+                document.getElementById('status').textContent='Status: Loaded on vessel';},700);
+              return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result">
+              <div>Container MSDU7172233</div>
+              <div id="status">Status: Container picked up</div>
+            </div>
+            </body></html>
+            """;
+
+    /** A real render replaces the result nodes but leaves the status unchanged. */
+    private static final String REAL_RENDER_SAME_STATUS = """
+            <html><body>
+            <form onsubmit="var r=document.getElementById('result');
+              var a=document.createElement('div'); a.textContent='Container MSDU7172233';
+              var b=document.createElement('div'); b.id='status';
+              b.textContent='Status: Container picked up';
+              var u=document.createElement('div'); u.textContent='Updated 10:00:01';
+              r.replaceChildren(a,b,u);return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result">
+              <div>Container MSDU7172233</div>
+              <div id="status">Status: Container picked up</div>
+              <div id="updated">Updated 10:00:00</div>
+            </div>
+            </body></html>
+            """;
+
     /** The tracking request answers 302 to a final 429 that no longer carries the box number. */
     private static final String REDIRECTED_TRACK_429 = """
             <html><body>
@@ -358,6 +426,44 @@ class MscProbeBrowserTest {
     }
 
     @Test
+    void neverAdoptsAStaleResultWhenOnlyASameContainerBeaconSucceeds() {
+        properties.setQueryTimeoutMs(1_500);
+        properties.setResultWaitMs(300);
+        properties.setBaseUrl(baseUrl("/beacon-stale"));
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
+    }
+
+    @Test
+    void neverTreatsAnUnrelatedTextChangeAsARefresh() {
+        properties.setQueryTimeoutMs(1_500);
+        properties.setResultWaitMs(300);
+        properties.setBaseUrl(baseUrl("/time-only"));
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
+    }
+
+    @Test
+    void waitsForTheRenderEvenWhenTheTrackingCallReturned200Early() {
+        properties.setQueryTimeoutMs(3_000);
+        properties.setResultWaitMs(3_000);
+        properties.setBaseUrl(baseUrl("/track-200-before-render"));
+        TrackingOutcome outcome = probe.query("MSDU7172233");
+
+        assertThat(outcome).isInstanceOf(TrackingOutcome.Success.class);
+        assertThat(((TrackingOutcome.Success) outcome).parsed().rawStatus())
+                .contains("Loaded on vessel");
+    }
+
+    @Test
+    void acceptsARealRenderThatLeavesTheStatusUnchanged() {
+        properties.setBaseUrl(baseUrl("/real-render-same-status"));
+        TrackingOutcome outcome = probe.query("MSDU7172233");
+
+        assertThat(outcome).isInstanceOf(TrackingOutcome.Success.class);
+        assertThat(((TrackingOutcome.Success) outcome).parsed().rawStatus())
+                .contains("Container picked up");
+    }
+
+    @Test
     void followsTheTrackingRedirectToItsFinal429() {
         properties.setBaseUrl(baseUrl("/redirect-429"));
         assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.RATE_LIMITED);
@@ -391,6 +497,12 @@ class MscProbeBrowserTest {
             case "/stale-same-result" -> respond(exchange, 200, STALE_SAME_RESULT);
             case "/fresh-same-result" -> respond(exchange, 200, FRESH_SAME_RESULT);
             case "/redirect-429" -> respond(exchange, 200, REDIRECTED_TRACK_429);
+            case "/beacon-stale" -> respond(exchange, 200, BEACON_200_WITH_STALE_RESULT);
+            case "/time-only" -> respond(exchange, 200, TIME_ONLY_UPDATE);
+            case "/track-200-before-render" -> respond(exchange, 200, TRACK_200_BEFORE_RENDER);
+            case "/real-render-same-status" -> respond(exchange, 200, REAL_RENDER_SAME_STATUS);
+            case "/beacon" -> respond(exchange, 200, "{\"ok\":true}");
+            case "/track-200" -> respond(exchange, 200, "{\"ok\":true}");
             case "/track-redirect" -> redirect(exchange, "/track-final");
             case "/track-final" -> respond(exchange, 429, "too many requests");
             case "/config" -> respond(exchange, 200, "{\"ok\":true}");

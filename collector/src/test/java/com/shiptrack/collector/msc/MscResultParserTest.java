@@ -327,6 +327,43 @@ class MscResultParserTest {
     }
 
     @Test
+    void dropsAnArrivalAtAnotherPortThatSharesARowWithThePod() {
+        String body = """
+                Container MSDU7172233
+                Status: Loaded on vessel
+                Port of Discharge: Vancouver, CA
+                Expected arrival at Seattle: 2026-12-05 | POD: Vancouver
+                """;
+        assertThat(parser.parse(snapshot(body, null, List.of()), "MSDU7172233").etas()).isEmpty();
+    }
+
+    @Test
+    void doesNotBindAPendingArrivalToADischargeDateInTheSameRow() {
+        String body = """
+                Container MSDU7172233
+                Status: Loaded on vessel
+                Port of Discharge: Vancouver, CA
+                Estimated arrival at POD: pending | Expected discharge at Vancouver: 2026-12-06
+                """;
+        assertThat(parser.parse(snapshot(body, null, List.of()), "MSDU7172233").etas()).isEmpty();
+    }
+
+    @Test
+    void keepsAnArrivalDateInItsOwnFieldBesideAnotherPortsField() {
+        String body = """
+                Container MSDU7172233
+                Status: Loaded on vessel
+                Port of Discharge: Vancouver, CA
+                Expected discharge at Vancouver: 2026-12-06 | Estimated arrival at POD: 2026-12-07
+                """;
+        ParsedTracking parsed = parser.parse(snapshot(body, null, List.of()), "MSDU7172233");
+
+        assertThat(parsed.etas()).hasSize(1);
+        assertThat(parsed.etas().getFirst().milestone()).isEqualTo(TrackedMilestone.POD_ARRIVAL);
+        assertThat(parsed.etas().getFirst().date()).isEqualTo(LocalDate.of(2026, 12, 7));
+    }
+
+    @Test
     void refusesABlockWithTwoConflictingStatusLines() {
         String block = """
                 Container MSDU7172233

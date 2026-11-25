@@ -34,6 +34,14 @@ public class MscProperties {
     private String eventRowSelector =
             "[data-testid='event-row'], .timeline li, .tracking-events li, table tbody tr";
 
+    /**
+     * Path pattern of the carrier's real tracking call. Only a request whose
+     * path matches this, names the queried container and starts with the
+     * submit can be correlated with the result. Analytics beacons that embed
+     * the container number therefore never stand in for the tracking call.
+     */
+    private String trackingUrlPattern = "(?i)(?:track|shipment|container|cargo|search|api)";
+
     /** No result but one of these phrases means the container is unknown. */
     private List<String> notFoundTexts = new ArrayList<>(List.of(
             "no results found",
@@ -116,6 +124,14 @@ public class MscProperties {
 
     public void setEventRowSelector(String eventRowSelector) {
         this.eventRowSelector = eventRowSelector;
+    }
+
+    public String getTrackingUrlPattern() {
+        return trackingUrlPattern;
+    }
+
+    public void setTrackingUrlPattern(String trackingUrlPattern) {
+        this.trackingUrlPattern = trackingUrlPattern;
     }
 
     public List<String> getNotFoundTexts() {
