@@ -332,6 +332,35 @@ class MscProbeBrowserTest {
             """;
 
     /**
+     * A genuine rebuild whose content is still changing: the fresh block first
+     * shows a mid-render status and only 250 ms later settles on the final
+     * one. With the settle window disabled by config it must not be adopted
+     * from a single snapshot.
+     */
+    private static final String SETTLE_ZERO_MID_RENDER = """
+            <html><body>
+            <form onsubmit="fetch('/track-200?container=MSDU7172233');
+              var r=document.getElementById('result');
+              var a=document.createElement('div'); a.textContent='Container MSDU7172233';
+              var b=document.createElement('div'); b.id='status'; b.textContent='Status: Loaded on vessel';
+              var e=document.createElement('div'); e.className='event';
+              e.textContent='Loaded on vessel - 2026-11-22 08:00 UTC';
+              r.replaceChildren(a,b,e);
+              setTimeout(function(){
+                document.getElementById('status').textContent='Status: Container picked up';},250);
+              return false;">
+              <input id="container" name="container">
+              <button id="track" type="submit">Track</button>
+            </form>
+            <div id="result">
+              <div>Container MSDU7172233</div>
+              <div id="status">Status: Container in transit</div>
+              <div class="event">Gate in - 2026-11-21 16:20 CET</div>
+            </div>
+            </body></html>
+            """;
+
+    /**
      * The calibrated live card structure ({@code msc-flow-tracking__*}); the
      * card is created on submit, as on the real page, so it is a genuine
      * render of this query.
@@ -683,6 +712,36 @@ class MscProbeBrowserTest {
     }
 
     @Test
+    void doesNotAdoptAMidRenderStatusWhenTheSettleWindowIsConfiguredToZero() {
+        // Regression for the eighth-review blocker B: a zero settle setting
+        // must not skip the second read. The first snapshot is the mid-render
+        // "Loaded on vessel"; only after the window does it become
+        // "Container picked up". Adopting the first snapshot would publish a
+        // value the page never settled on.
+        properties.setResultSettleMs(0);
+        properties.setBaseUrl(baseUrl("/settle-zero-mid-render"));
+        TrackingOutcome outcome = probe.query("MSDU7172233");
+
+        assertThat(outcome).isInstanceOf(TrackingOutcome.Success.class);
+        String status = ((TrackingOutcome.Success) outcome).parsed().rawStatus();
+        assertThat(status).contains("Container picked up");
+        assertThat(status).doesNotContain("Loaded on vessel");
+    }
+
+    @Test
+    void stillAcceptsAStableRenderWhenTheSettleWindowIsConfiguredToZero() {
+        // The positive side of B: with settle set to zero the mandatory second
+        // read still runs and, when both reads agree, the result is adopted.
+        properties.setResultSettleMs(0);
+        properties.setBaseUrl(baseUrl("/real-render-same-status"));
+        TrackingOutcome outcome = probe.query("MSDU7172233");
+
+        assertThat(outcome).isInstanceOf(TrackingOutcome.Success.class);
+        assertThat(((TrackingOutcome.Success) outcome).parsed().rawStatus())
+                .contains("Container picked up");
+    }
+
+    @Test
     void followsTheTrackingRedirectToItsFinal429() {
         properties.setBaseUrl(baseUrl("/redirect-429"));
         assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.RATE_LIMITED);
@@ -721,6 +780,7 @@ class MscProbeBrowserTest {
             case "/time-only" -> respond(exchange, 200, TIME_ONLY_UPDATE);
             case "/track-200-before-render" -> respond(exchange, 200, TRACK_200_BEFORE_RENDER);
             case "/real-render-same-status" -> respond(exchange, 200, REAL_RENDER_SAME_STATUS);
+            case "/settle-zero-mid-render" -> respond(exchange, 200, SETTLE_ZERO_MID_RENDER);
             case "/staged-row" -> respond(exchange, 200, STAGED_RENDER_DROPS_ROW_FIRST);
             case "/staged-edit" -> respond(exchange, 200, STAGED_RENDER_EDITS_ROW_FIRST);
             case "/staged-reveal" -> respond(exchange, 200, STAGED_REVEAL_SECOND_BLOCK);

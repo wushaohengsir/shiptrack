@@ -61,6 +61,11 @@ public class MscProbe implements MscTrackingClient {
 
     private static final Logger log = LoggerFactory.getLogger(MscProbe.class);
     private static final long POLL_INTERVAL_MS = 200;
+    /**
+     * Lower bound for the settle window. Config may lengthen it but a zero or
+     * negative setting cannot skip the mandatory second read.
+     */
+    static final long MIN_SETTLE_MS = 500;
     private static final int MAX_REDIRECT_HOPS = 10;
     private static final int MAX_RESULT_BLOCKS = 10;
     /** Tolerance for the millisecond clock Playwright uses for request timing. */
@@ -478,10 +483,10 @@ public class MscProbe implements MscTrackingClient {
     private ResultObservation confirmSettled(Page page, String containerNo, long deadline,
                                              ResultBaseline before,
                                              ResultObservation first) {
-        long settleMs = properties.getResultSettleMs();
-        if (settleMs <= 0) {
-            return first;
-        }
+        // The settle window can be widened by config but never disabled: a
+        // zero or negative value still forces a second read, so a render that
+        // is still staging its content can never be adopted from one snapshot.
+        long settleMs = Math.max(MIN_SETTLE_MS, properties.getResultSettleMs());
         if (remainingMsOrZero(deadline) < settleMs) {
             // Not enough budget left to prove stability.
             return null;
