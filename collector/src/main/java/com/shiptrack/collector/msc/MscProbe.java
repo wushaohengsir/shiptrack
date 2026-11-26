@@ -238,6 +238,10 @@ public class MscProbe implements MscTrackingClient {
             return signalFailure(landingError.get(), landing, run);
         }
 
+        // The OneTrust consent layer sits above the tracking form and
+        // intercepts the submit click until it is accepted.
+        dismissConsent(page, deadline);
+
         Locator input;
         try {
             page.waitForSelector(properties.getContainerInputSelector(),
@@ -286,6 +290,7 @@ public class MscProbe implements MscTrackingClient {
         try {
             try {
                 input.fill(containerNo, new Locator.FillOptions().setTimeout(remainingMs(deadline)));
+                dismissConsent(page, deadline);
                 submitLocator(page)
                         .click(new Locator.ClickOptions().setTimeout(remainingMs(deadline)));
             } catch (TimeoutError e) {
@@ -391,6 +396,43 @@ public class MscProbe implements MscTrackingClient {
                     || haystack.contains("sign in");
         } catch (PlaywrightException e) {
             return false;
+        }
+    }
+
+    /**
+     * Accepts the cookie consent if one is shown, then drops any overlay node
+     * that survived. The context is thrown away after the query, so nothing
+     * is remembered beyond it; without this the consent dark filter swallows
+     * every click on the form.
+     */
+    private void dismissConsent(Page page, long deadline) {
+        List<String> selectors = properties.getConsentSelectors();
+        if (selectors != null) {
+            for (String selector : selectors) {
+                if (selector == null || selector.isBlank()) {
+                    continue;
+                }
+                Locator control = page.locator(selector);
+                try {
+                    if (control.count() == 0 || !control.first().isVisible()) {
+                        continue;
+                    }
+                    long timeout = Math.min(5_000, Math.max(1, remainingMsOrZero(deadline)));
+                    control.first().click(new Locator.ClickOptions().setTimeout(timeout));
+                    log.info("Dismissed the MSC cookie consent overlay");
+                    break;
+                } catch (PlaywrightException e) {
+                    log.debug("Cookie consent control {} was not clickable: {}",
+                            selector, firstLine(e.getMessage()));
+                }
+            }
+        }
+        try {
+            page.evaluate("() => { document.querySelectorAll("
+                    + "'#onetrust-consent-sdk, .onetrust-pc-dark-filter')"
+                    + ".forEach(node => node.remove()); }");
+        } catch (PlaywrightException e) {
+            log.debug("Could not clear a leftover consent overlay: {}", firstLine(e.getMessage()));
         }
     }
 

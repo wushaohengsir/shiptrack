@@ -105,6 +105,17 @@ public class MscProperties {
     /** If a password box is visible the site forced a login. */
     private String loginFieldSelector = "input[type='password']";
 
+    /**
+     * OneTrust consent controls cover the page until one is accepted, so the
+     * form's submit click is intercepted by the dark filter. The first visible
+     * control is clicked; any leftover overlay node is then removed for this
+     * context only (each query gets a fresh context).
+     */
+    private List<String> consentSelectors = new ArrayList<>(List.of(
+            "#onetrust-accept-btn-handler",
+            "#accept-recommended-btn-handler",
+            "#onetrust-reject-all-handler"));
+
     private int resultWaitMs = 30_000;
     /**
      * How long the result content must stay unchanged before it is accepted.
@@ -259,6 +270,14 @@ public class MscProperties {
 
     public void setLoginFieldSelector(String loginFieldSelector) {
         this.loginFieldSelector = loginFieldSelector;
+    }
+
+    public List<String> getConsentSelectors() {
+        return consentSelectors;
+    }
+
+    public void setConsentSelectors(List<String> consentSelectors) {
+        this.consentSelectors = consentSelectors;
     }
 
     public int getResultWaitMs() {

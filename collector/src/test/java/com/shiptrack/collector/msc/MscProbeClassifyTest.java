@@ -27,6 +27,8 @@ class MscProbeClassifyTest {
                 .isEqualTo(".msc-flow-tracking__form button.msc-search-autocomplete__search");
         assertThat(properties.getLegacySubmitSelector())
                 .isEqualTo("button[type='submit'], button:has-text('Track')");
+        assertThat(properties.getConsentSelectors())
+                .startsWith("#onetrust-accept-btn-handler");
     }
 
     @Test

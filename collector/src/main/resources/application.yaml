@@ -60,6 +60,8 @@ collector:
     summary-selector: ${MSC_SUMMARY_SELECTOR:.msc-flow-tracking__data}
     summary-heading-selector: ${MSC_SUMMARY_HEADING_SELECTOR:.data-heading}
     summary-value-selector: ${MSC_SUMMARY_VALUE_SELECTOR:.data-value}
+    # OneTrust covers the form until consent is given; the probe dismisses it.
+    consent-selectors: "${MSC_CONSENT_SELECTORS:#onetrust-accept-btn-handler,#accept-recommended-btn-handler,#onetrust-reject-all-handler}"
     # msc.com renders numeric dates day-first (07/12/2026 = 7 December).
     day-first: ${MSC_DAY_FIRST:true}
 
