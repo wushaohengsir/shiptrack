@@ -363,10 +363,11 @@ public class MscProbe implements MscTrackingClient {
             }
             // A block that was already visible before submission was never
             // proven to belong to this query. Publishing it is exactly the
-            // stale-result bug AC-29 forbids. When no fresh render was
-            // observed, the snapshot above holds the stale block (if any), so
-            // this is a classified timeout, never a success.
-            if (wait.result() != WaitResult.RESULT && snapshot.resultBlockText() != null) {
+            // stale-result bug AC-29 forbids. When a result block was seen at
+            // all during the wait (even if reading its text raced the budget),
+            // this is a classified timeout, never a parse error.
+            if (wait.result() != WaitResult.RESULT
+                    && (snapshot.resultBlockText() != null || wait.observation() != null)) {
                 recordFailure(run);
                 return timeout("MSC result block was not refreshed for container " + containerNo);
             }
