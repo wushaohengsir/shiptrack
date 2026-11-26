@@ -68,6 +68,8 @@ public class MscProbe implements MscTrackingClient {
     static final long MIN_SETTLE_MS = 500;
     private static final int MAX_REDIRECT_HOPS = 10;
     private static final int MAX_RESULT_BLOCKS = 10;
+    /** Upper bound on submit-control candidates inspected for one form. */
+    private static final int MAX_SUBMIT_CANDIDATES = 10;
     /** Tolerance for the millisecond clock Playwright uses for request timing. */
     private static final long START_TIME_SKEW_MS = 200;
 
@@ -261,6 +263,16 @@ public class MscProbe implements MscTrackingClient {
         // merely revealed.
         ResultBaseline beforeSubmit = recordResultBaseline(page, containerNo, deadline);
 
+        // Fill the form and clear the consent layer before the response
+        // listener starts, so a consent or analytics call can never be
+        // correlated with this container's submit.
+        try {
+            input.fill(containerNo, new Locator.FillOptions().setTimeout(remainingMs(deadline)));
+            dismissConsent(page, deadline);
+        } catch (TimeoutError e) {
+            return formFailure(deadline, run, "MSC tracking form could not be filled or submitted");
+        }
+
         long submitStartedAt = System.currentTimeMillis();
         AtomicReference<SubmitResponse> correlated = new AtomicReference<>();
         AtomicReference<SubmitResponse> fallbackError = new AtomicReference<>();
@@ -276,9 +288,15 @@ public class MscProbe implements MscTrackingClient {
                 return;
             }
             if (signal.correlated()) {
-                // Last response of the chain wins: 302 followed by 429 must end
-                // as RATE_LIMITED.
-                correlated.set(signal);
+                // The chain's definitive outcome wins. Response events for a
+                // redirect chain can be delivered out of order (the final 429
+                // sometimes arrives before its 302 hop), so a later 3xx hop
+                // must never overwrite an already-recorded 2xx/>=400 outcome.
+                SubmitResponse previous = correlated.get();
+                if (previous == null || !(isRedirect(signal.status())
+                        && !isRedirect(previous.status()))) {
+                    correlated.set(signal);
+                }
             } else {
                 fallbackAny.set(signal);
                 if (signal.status() >= 400) {
@@ -289,9 +307,7 @@ public class MscProbe implements MscTrackingClient {
         page.onResponse(responseListener);
         try {
             try {
-                input.fill(containerNo, new Locator.FillOptions().setTimeout(remainingMs(deadline)));
-                dismissConsent(page, deadline);
-                submitLocator(page)
+                submitLocator(page, input)
                         .click(new Locator.ClickOptions().setTimeout(remainingMs(deadline)));
             } catch (TimeoutError e) {
                 return formFailure(deadline, run, "MSC tracking form could not be filled or submitted");
@@ -304,18 +320,34 @@ public class MscProbe implements MscTrackingClient {
             MscPageSnapshot snapshot =
                     capture(page, containerNo, deadline, false, wait.observation());
 
+            SubmitResponse response = effectiveResponse(correlated, fallbackError, fallbackAny);
+            // A 401/403 is only trusted when it came from this container's
+            // tracking call (or from the landing navigation, handled above).
+            // An unrelated background 401/403 must not turn into a tracking
+            // login/source failure.
+            AgentErrorCode correlatedAuth = correlatedAuthError(response);
+
             Optional<AgentErrorCode> error = errorClassifier.classify(snapshot);
             if (error.isPresent()) {
+                // A correlated 401/403 outranks the generic "no tracking
+                // information" text a WAF or error page shows, but a captcha or
+                // a forced-login password field stays authoritative.
+                if (correlatedAuth != null && error.get() == AgentErrorCode.CONTAINER_NOT_FOUND) {
+                    recordFailure(run);
+                    return new TrackingOutcome.Failure(correlatedAuth,
+                            "MSC tracking request returned HTTP " + response.status());
+                }
                 return signalFailure(error.get(), snapshot, run);
             }
 
-            SubmitResponse response = effectiveResponse(correlated, fallbackError, fallbackAny);
             // A result block for the queried container wins over an unrelated
             // background failure. Only a correlated tracking error, or a
             // failure when no result rendered, is terminal here.
             if (response != null && response.status() >= 400
                     && (response.correlated() || wait.result() != WaitResult.RESULT)) {
-                AgentErrorCode code = statusError(response.status());
+                AgentErrorCode code = response.correlated()
+                        ? statusError(response.status())
+                        : fallbackStatusError(response.status());
                 if (code != null) {
                     if (response.status() == 429) {
                         deferAfterRateLimit(response.retryAfterSeconds());
@@ -364,36 +396,77 @@ public class MscProbe implements MscTrackingClient {
      * match that is really the header myMSC login/sign-in link is skipped so
      * a query never turns into a redirect to the identity provider.
      */
-    private Locator submitLocator(Page page) {
+    private Locator submitLocator(Page page, Locator input) {
         Locator precise = page.locator(properties.getSubmitSelector());
-        if (precise.count() > 0) {
-            return precise.first();
+        Locator chosen = firstNonLoginControl(precise);
+        if (chosen != null) {
+            return chosen;
         }
-        Locator legacy = page.locator(properties.getLegacySubmitSelector());
-        int candidates = legacy.count();
-        for (int i = 0; i < candidates; i++) {
-            Locator candidate = legacy.nth(i);
+        // Older layouts: only look inside the form that owns the filled
+        // container input. A page-wide search can hand back the header myMSC
+        // login button, which sends the query to the identity provider.
+        Locator form = trackingFormOf(input);
+        if (form != null) {
+            Locator legacy = form.locator(properties.getLegacySubmitSelector());
+            chosen = firstNonLoginControl(legacy);
+            if (chosen != null) {
+                return chosen;
+            }
+        }
+        // Nothing trustworthy: clicking this surfaces the usual timeout, which
+        // the caller reports as a form failure, rather than clicking a login.
+        return precise.first();
+    }
+
+    private static Locator firstNonLoginControl(Locator candidates) {
+        int count = Math.min(candidates.count(), MAX_SUBMIT_CANDIDATES);
+        for (int i = 0; i < count; i++) {
+            Locator candidate = candidates.nth(i);
             if (!looksLikeLoginControl(candidate)) {
                 return candidate;
             }
         }
-        // Nothing usable: clicking this surfaces the usual timeout, which the
-        // caller already reports as a form failure.
-        return precise.first();
+        return null;
     }
 
+    /** The form ancestor of the filled container input, or null when none. */
+    private static Locator trackingFormOf(Locator input) {
+        try {
+            Locator form = input.locator("xpath=ancestor::form[1]");
+            return form.count() > 0 ? form.first() : null;
+        } catch (PlaywrightException e) {
+            return null;
+        }
+    }
+
+    /**
+     * A submit control is a login control when its own text/class/href/aria
+     * label or its owning form's action points at the identity provider. This
+     * catches icon-only myMSC buttons whose only tell is the aria label or the
+     * outer form's action.
+     */
     private static boolean looksLikeLoginControl(Locator candidate) {
         try {
             String text = candidate.innerText();
             String className = candidate.getAttribute("class");
             String href = candidate.getAttribute("href");
+            String ariaLabel = candidate.getAttribute("aria-label");
+            String formAction = candidate.evaluate(
+                    "el => { const f = el.form || (el.closest ? el.closest('form') : null);"
+                            + " return f ? f.getAttribute('action') : null; }") instanceof String action
+                    ? action
+                    : null;
             String haystack = ((text == null ? "" : text) + " "
                     + (className == null ? "" : className) + " "
-                    + (href == null ? "" : href)).toLowerCase(Locale.ROOT);
+                    + (href == null ? "" : href) + " "
+                    + (ariaLabel == null ? "" : ariaLabel) + " "
+                    + (formAction == null ? "" : formAction)).toLowerCase(Locale.ROOT);
             return haystack.contains("mymsc")
                     || haystack.contains("login")
                     || haystack.contains("log in")
-                    || haystack.contains("sign in");
+                    || haystack.contains("sign in")
+                    || haystack.contains("signin")
+                    || haystack.contains("identity");
         } catch (PlaywrightException e) {
             return false;
         }
@@ -434,6 +507,19 @@ public class MscProbe implements MscTrackingClient {
         } catch (PlaywrightException e) {
             log.debug("Could not clear a leftover consent overlay: {}", firstLine(e.getMessage()));
         }
+        if (consentOverlayVisible(page)) {
+            log.warn("MSC cookie consent overlay is still present; the submit click may be intercepted");
+        }
+    }
+
+    private static boolean consentOverlayVisible(Page page) {
+        String selector = "#onetrust-consent-sdk, .onetrust-pc-dark-filter";
+        try {
+            Locator overlay = page.locator(selector).first();
+            return overlay.count() > 0 && overlay.isVisible();
+        } catch (PlaywrightException e) {
+            return false;
+        }
     }
 
     static AgentErrorCode statusError(int status) {
@@ -443,6 +529,42 @@ public class MscProbe implements MscTrackingClient {
         if (status == 403) {
             return AgentErrorCode.SOURCE_UNAVAILABLE;
         }
+        if (status == 429) {
+            return AgentErrorCode.RATE_LIMITED;
+        }
+        if (status >= 500) {
+            return AgentErrorCode.SOURCE_UNAVAILABLE;
+        }
+        return null;
+    }
+
+    /**
+     * 401/403 are only trusted from a call correlated with this container's
+     * submit. A background request's 401/403 says nothing about this query.
+     */
+    private static AgentErrorCode correlatedAuthError(SubmitResponse response) {
+        if (response == null || !response.correlated()) {
+            return null;
+        }
+        if (response.status() == 401) {
+            return AgentErrorCode.LOGIN_REQUIRED;
+        }
+        if (response.status() == 403) {
+            return AgentErrorCode.SOURCE_UNAVAILABLE;
+        }
+        return null;
+    }
+
+    /**
+     * A non-correlated background failure may still evidence throttling or an
+     * unavailable carrier (429/5xx), but never a login or an access denial that
+     * is not tied to this query.
+     */
+    private static boolean isRedirect(int status) {
+        return status >= 300 && status < 400;
+    }
+
+    private static AgentErrorCode fallbackStatusError(int status) {
         if (status == 429) {
             return AgentErrorCode.RATE_LIMITED;
         }

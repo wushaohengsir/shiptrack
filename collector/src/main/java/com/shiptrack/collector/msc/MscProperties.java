@@ -106,15 +106,16 @@ public class MscProperties {
     private String loginFieldSelector = "input[type='password']";
 
     /**
-     * OneTrust consent controls cover the page until one is accepted, so the
-     * form's submit click is intercepted by the dark filter. The first visible
-     * control is clicked; any leftover overlay node is then removed for this
-     * context only (each query gets a fresh context).
+     * OneTrust consent controls cover the page until one is dismissed, so the
+     * form's submit click is intercepted by the dark filter. Essential-only
+     * (reject optional) is preferred over accepting all; the first visible
+     * control is clicked, and any leftover overlay node is then removed for
+     * this context only (each query gets a fresh context).
      */
     private List<String> consentSelectors = new ArrayList<>(List.of(
+            "#onetrust-reject-all-handler",
             "#onetrust-accept-btn-handler",
-            "#accept-recommended-btn-handler",
-            "#onetrust-reject-all-handler"));
+            "#accept-recommended-btn-handler"));
 
     private int resultWaitMs = 30_000;
     /**

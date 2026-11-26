@@ -446,6 +446,40 @@ class MscProbeBrowserTest {
             </body></html>
             """;
 
+    private final java.util.concurrent.atomic.AtomicInteger localLoginHits =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
+     * A header myMSC login form placed before the tracking form: its submit
+     * button is icon-only and only the outer form action names the identity
+     * provider. A page-wide submit fallback would click it.
+     */
+    private static final String LOCAL_ICON_LOGIN = """
+            <header><form action="/identity/externallogin">
+              <button type="submit" aria-label="myMSC"><svg width="10" height="10"></svg></button>
+            </form></header>
+            """;
+
+    private static final String LOCAL_REVIEW_PAGE =
+            OK_PAGE.replace("<body>", "<body>" + LOCAL_ICON_LOGIN);
+    private static final String LOCAL_PRECISE_REVIEW_PAGE = LOCAL_REVIEW_PAGE
+            .replace("<form onsubmit", "<form class='msc-flow-tracking__form' onsubmit")
+            .replace("id=\"track\"", "id='track' class='msc-search-autocomplete__search'");
+
+    /** A consent layer with a working accept control that removes itself. */
+    private static final String CONSENT_CONTROL_PAGE = OK_PAGE.replace("<body>",
+            "<body><div id='onetrust-consent-sdk'>"
+                    + "<div class='onetrust-pc-dark-filter' style='position:fixed;inset:0;"
+                    + "z-index:90000;background:rgba(0,0,0,.4)'></div>"
+                    + "<button id='onetrust-accept-btn-handler' style='position:relative;z-index:90001'"
+                    + " onclick=\"document.getElementById('onetrust-consent-sdk').remove()\">"
+                    + "Accept All</button></div>");
+
+    /** A consent dark filter with no usable dismiss control (removed via JS). */
+    private static final String CONSENT_DARK_FILTER_ONLY_PAGE = OK_PAGE.replace("<body>",
+            "<body><div class='onetrust-pc-dark-filter' style='position:fixed;inset:0;"
+                    + "z-index:90000;background:rgba(0,0,0,.4)'></div>");
+
     private HttpServer server;
     private PlaywrightBrowserSessionFactory factory;
     private MscProperties properties;
@@ -747,6 +781,83 @@ class MscProbeBrowserTest {
         assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.RATE_LIMITED);
     }
 
+    // --- Regression fixtures from the M5-D review (Codex v1.0) ---
+
+    @Test
+    void reviewLegacySubmitNeverClicksHeaderLoginForm() {
+        configureReview("/review-legacy");
+        properties.setSubmitSelector(new MscProperties().getSubmitSelector());
+        TrackingOutcome outcome = probe.query("MSDU7172233");
+
+        assertThat(localLoginHits.get()).as("header login requests; outcome %s", outcome).isZero();
+        assertThat(outcome).isInstanceOf(TrackingOutcome.Success.class);
+    }
+
+    @Test
+    void reviewPreciseSubmitWinsOverHeaderLoginForm() {
+        configureReview("/review-precise");
+        properties.setSubmitSelector(new MscProperties().getSubmitSelector());
+        TrackingOutcome outcome = probe.query("MSDU7172233");
+
+        assertThat(localLoginHits.get()).isZero();
+        assertThat(outcome).isInstanceOf(TrackingOutcome.Success.class);
+    }
+
+    @Test
+    void reviewUnrelated401CannotBecomeTrackingLoginFailure() {
+        configureReview("/review-background-401");
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
+    }
+
+    @Test
+    void reviewUnrelated403CannotBecomeTrackingSourceFailure() {
+        configureReview("/review-background-403");
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
+    }
+
+    @Test
+    void reviewRelated403OverridesGenericNoTrackingInformation() {
+        configureReview("/review-mixed-403");
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.SOURCE_UNAVAILABLE);
+    }
+
+    @Test
+    void reviewRelated403WithoutPageTextIsSourceFailure() {
+        configureReview("/review-track-only-403");
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.SOURCE_UNAVAILABLE);
+    }
+
+    @Test
+    void reviewExplicitMissingContainerIsNotFound() {
+        configureReview("/review-real-not-found");
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.CONTAINER_NOT_FOUND);
+    }
+
+    private void configureReview(String path) {
+        properties.setBaseUrl(baseUrl(path));
+        properties.setQueryTimeoutMs(7_000);
+        properties.setResultWaitMs(1_500);
+    }
+
+    // --- OneTrust consent-layer handling ---
+
+    @Test
+    void submitsWhenNoConsentLayerIsShown() {
+        assertThat(probe.query("MSDU7172233")).isInstanceOf(TrackingOutcome.Success.class);
+    }
+
+    @Test
+    void dismissesAConsentLayerUsingItsControl() {
+        properties.setBaseUrl(baseUrl("/consent-control"));
+        assertThat(probe.query("MSDU7172233")).isInstanceOf(TrackingOutcome.Success.class);
+    }
+
+    @Test
+    void removesAConsentOverlayThatHasNoUsefulControl() {
+        properties.setBaseUrl(baseUrl("/consent-dark-filter"));
+        assertThat(probe.query("MSDU7172233")).isInstanceOf(TrackingOutcome.Success.class);
+    }
+
     private static AgentErrorCode failure(TrackingOutcome outcome) {
         assertThat(outcome).isInstanceOf(TrackingOutcome.Failure.class);
         return ((TrackingOutcome.Failure) outcome).errorCode();
@@ -758,6 +869,29 @@ class MscProbeBrowserTest {
 
     private void dispatch(HttpExchange exchange) throws IOException {
         switch (exchange.getRequestURI().getPath()) {
+            case "/review-legacy" -> respond(exchange, 200, LOCAL_REVIEW_PAGE);
+            case "/review-precise" -> respond(exchange, 200, LOCAL_PRECISE_REVIEW_PAGE);
+            case "/identity/externallogin" -> {
+                localLoginHits.incrementAndGet();
+                respond(exchange, 200, "<html><body><input type='password'></body></html>");
+            }
+            case "/review-background-401" -> respond(exchange, 200,
+                    SUBMIT_FORM.formatted("fetch('/review-banner')"));
+            case "/review-banner" -> respond(exchange, 401, "session unavailable");
+            case "/review-background-403" -> respond(exchange, 200,
+                    SUBMIT_FORM.formatted("fetch('/review-banner-403')"));
+            case "/review-banner-403" -> respond(exchange, 403, "forbidden");
+            case "/review-mixed-403" -> respond(exchange, 200, SUBMIT_FORM.formatted(
+                    "var c=document.getElementById('container').value;"
+                    + "var req = new XMLHttpRequest();req.open('GET','/track-403?container='+c,false);"
+                    + "req.send();document.body.append('No tracking information')"));
+            case "/review-track-only-403" -> respond(exchange, 200, SUBMIT_FORM.formatted(
+                    "var c=document.getElementById('container').value;fetch('/track-403?container='+c)"));
+            case "/review-real-not-found" -> respond(exchange, 200,
+                    SUBMIT_FORM.formatted("document.body.append('Container not found')"));
+            case "/track-403" -> respond(exchange, 403, "forbidden");
+            case "/consent-control" -> respond(exchange, 200, CONSENT_CONTROL_PAGE);
+            case "/consent-dark-filter" -> respond(exchange, 200, CONSENT_DARK_FILTER_ONLY_PAGE);
             case "/ok" -> respond(exchange, 200, OK_PAGE);
             case "/live-structure" -> respond(exchange, 200, LIVE_STRUCTURE_PAGE);
             case "/changed" -> respond(exchange, 200, CHANGED_PAGE);
