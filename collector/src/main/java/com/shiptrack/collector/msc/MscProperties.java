@@ -23,7 +23,20 @@ public class MscProperties {
             "input[name='trackingNumber'], input#trackingNumber, "
                     + "input[placeholder*='Container'], input[placeholder*='container']";
 
-    private String submitSelector = "button[type='submit'], button:has-text('Track')";
+    /**
+     * The real submit control of the tracking form is the search icon button.
+     * A broad {@code button[type='submit']} would hit the header myMSC login
+     * button first, which redirects to the identity provider.
+     */
+    private String submitSelector =
+            ".msc-flow-tracking__form button.msc-search-autocomplete__search";
+
+    /**
+     * Older page layouts only. It is consulted solely when the precise
+     * selector matches nothing, and a control that looks like the myMSC
+     * login/sign-in link is never clicked.
+     */
+    private String legacySubmitSelector = "button[type='submit'], button:has-text('Track')";
 
     private String resultSelector =
             ".msc-flow-tracking__container, [data-testid='tracking-result'], "
@@ -80,6 +93,15 @@ public class MscProperties {
             "rate limit",
             "try again later"));
 
+    /**
+     * An edge/WAF denial is the carrier being unreachable, not a changed page.
+     * Without this the probe waited for the form and reported PARSE_ERROR.
+     */
+    private List<String> accessDeniedTexts = new ArrayList<>(List.of(
+            "access denied",
+            "you don't have permission",
+            "you do not have permission"));
+
     /** If a password box is visible the site forced a login. */
     private String loginFieldSelector = "input[type='password']";
 
@@ -125,6 +147,14 @@ public class MscProperties {
 
     public void setSubmitSelector(String submitSelector) {
         this.submitSelector = submitSelector;
+    }
+
+    public String getLegacySubmitSelector() {
+        return legacySubmitSelector;
+    }
+
+    public void setLegacySubmitSelector(String legacySubmitSelector) {
+        this.legacySubmitSelector = legacySubmitSelector;
     }
 
     public String getResultSelector() {
@@ -213,6 +243,14 @@ public class MscProperties {
 
     public void setRateLimitTexts(List<String> rateLimitTexts) {
         this.rateLimitTexts = rateLimitTexts;
+    }
+
+    public List<String> getAccessDeniedTexts() {
+        return accessDeniedTexts;
+    }
+
+    public void setAccessDeniedTexts(List<String> accessDeniedTexts) {
+        this.accessDeniedTexts = accessDeniedTexts;
     }
 
     public String getLoginFieldSelector() {

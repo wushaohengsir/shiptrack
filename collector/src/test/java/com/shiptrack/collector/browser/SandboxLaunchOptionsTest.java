@@ -16,6 +16,8 @@ class SandboxLaunchOptionsTest {
 
         assertThat(options.chromiumSandbox).isTrue();
         assertThat(options.ignoreDefaultArgs).contains("--disable-dev-shm-usage");
+        // The full Chromium in new headless mode, not chrome-headless-shell.
+        assertThat(options.channel).isEqualTo("chromium");
 
         List<String> explicitArgs = options.args == null ? List.of() : options.args;
         assertThat(explicitArgs)

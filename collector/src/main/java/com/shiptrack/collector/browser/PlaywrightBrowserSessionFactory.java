@@ -92,11 +92,20 @@ public class PlaywrightBrowserSessionFactory implements BrowserSessionFactory {
      * is allowed.
      */
     BrowserType.LaunchOptions launchOptions(long timeoutMs) {
-        return new BrowserType.LaunchOptions()
+        BrowserType.LaunchOptions options = new BrowserType.LaunchOptions()
                 .setHeadless(properties.isHeadless())
                 .setChromiumSandbox(true)
                 .setTimeout(timeoutMs <= 0 ? 1 : timeoutMs)
                 .setIgnoreDefaultArgs(List.of("--disable-dev-shm-usage"));
+        if (properties.isHeadless()) {
+            // Playwright's default headless build is the stripped
+            // chrome-headless-shell, which msc.com's Akamai rule answers with
+            // "Access Denied". The "chromium" channel is the same full
+            // Chromium the headed browser uses, in its new headless mode; no
+            // stealth patch or fingerprint spoofing is involved.
+            options.setChannel("chromium");
+        }
+        return options;
     }
 
     @Override

@@ -286,7 +286,7 @@ public class MscProbe implements MscTrackingClient {
         try {
             try {
                 input.fill(containerNo, new Locator.FillOptions().setTimeout(remainingMs(deadline)));
-                page.locator(properties.getSubmitSelector()).first()
+                submitLocator(page)
                         .click(new Locator.ClickOptions().setTimeout(remainingMs(deadline)));
             } catch (TimeoutError e) {
                 return formFailure(deadline, run, "MSC tracking form could not be filled or submitted");
@@ -353,7 +353,54 @@ public class MscProbe implements MscTrackingClient {
         }
     }
 
+    /**
+     * Resolves the form's submit control. The precise selector comes first;
+     * the broad legacy selector is only a fallback for older layouts, and a
+     * match that is really the header myMSC login/sign-in link is skipped so
+     * a query never turns into a redirect to the identity provider.
+     */
+    private Locator submitLocator(Page page) {
+        Locator precise = page.locator(properties.getSubmitSelector());
+        if (precise.count() > 0) {
+            return precise.first();
+        }
+        Locator legacy = page.locator(properties.getLegacySubmitSelector());
+        int candidates = legacy.count();
+        for (int i = 0; i < candidates; i++) {
+            Locator candidate = legacy.nth(i);
+            if (!looksLikeLoginControl(candidate)) {
+                return candidate;
+            }
+        }
+        // Nothing usable: clicking this surfaces the usual timeout, which the
+        // caller already reports as a form failure.
+        return precise.first();
+    }
+
+    private static boolean looksLikeLoginControl(Locator candidate) {
+        try {
+            String text = candidate.innerText();
+            String className = candidate.getAttribute("class");
+            String href = candidate.getAttribute("href");
+            String haystack = ((text == null ? "" : text) + " "
+                    + (className == null ? "" : className) + " "
+                    + (href == null ? "" : href)).toLowerCase(Locale.ROOT);
+            return haystack.contains("mymsc")
+                    || haystack.contains("login")
+                    || haystack.contains("log in")
+                    || haystack.contains("sign in");
+        } catch (PlaywrightException e) {
+            return false;
+        }
+    }
+
     static AgentErrorCode statusError(int status) {
+        if (status == 401) {
+            return AgentErrorCode.LOGIN_REQUIRED;
+        }
+        if (status == 403) {
+            return AgentErrorCode.SOURCE_UNAVAILABLE;
+        }
         if (status == 429) {
             return AgentErrorCode.RATE_LIMITED;
         }

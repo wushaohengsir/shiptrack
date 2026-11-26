@@ -35,6 +35,9 @@ public final class MscErrorClassifier {
         if (containsAny(haystack, properties.getRateLimitTexts())) {
             return Optional.of(AgentErrorCode.RATE_LIMITED);
         }
+        if (containsAny(haystack, properties.getAccessDeniedTexts())) {
+            return Optional.of(AgentErrorCode.SOURCE_UNAVAILABLE);
+        }
         if (containsAny(haystack, properties.getNotFoundTexts())) {
             return Optional.of(AgentErrorCode.CONTAINER_NOT_FOUND);
         }

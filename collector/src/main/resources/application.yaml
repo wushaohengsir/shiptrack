@@ -52,7 +52,8 @@ collector:
     # Result-card selectors calibrated on 2026-11-25 against the live page
     # (msc-flow-tracking__*); older selectors remain as fallbacks.
     container-input-selector: ${MSC_CONTAINER_INPUT_SELECTOR:input[name='trackingNumber'], input#trackingNumber, input[placeholder*='Container'], input[placeholder*='container']}
-    submit-selector: ${MSC_SUBMIT_SELECTOR:button[type='submit'], button:has-text('Track')}
+    submit-selector: ${MSC_SUBMIT_SELECTOR:.msc-flow-tracking__form button.msc-search-autocomplete__search}
+    legacy-submit-selector: ${MSC_LEGACY_SUBMIT_SELECTOR:button[type='submit'], button:has-text('Track')}
     result-selector: ${MSC_RESULT_SELECTOR:.msc-flow-tracking__container, [data-testid='tracking-result'], .tracking-result, .tracking-details, .shipment-details}
     status-selector: ${MSC_STATUS_SELECTOR:[data-testid='status'], .tracking-status, .status-value, .shipment-status}
     event-row-selector: ${MSC_EVENT_ROW_SELECTOR:.msc-flow-tracking__step, [data-testid='event-row'], .timeline li, .tracking-events li, table tbody tr}

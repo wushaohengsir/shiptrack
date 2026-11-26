@@ -32,6 +32,16 @@ class MscErrorClassifierTest {
     }
 
     @Test
+    void anEdgeAccessDenialIsASourceFailureNotAParseError() {
+        MscPageSnapshot snapshot = new MscPageSnapshot(
+                "Access Denied", "https://www.msc.com/en/track-a-shipment",
+                "Access Denied You don't have permission to access this server.",
+                null, List.of(), false);
+        assertThat(classifier.classify(snapshot))
+                .contains(AgentErrorCode.SOURCE_UNAVAILABLE);
+    }
+
+    @Test
     void aNormalResultPageIsNotAnError() {
         MscPageSnapshot snapshot = page("Status: Loaded on vessel CAPE SOUNIO", false);
         assertThat(classifier.classify(snapshot)).isEmpty();

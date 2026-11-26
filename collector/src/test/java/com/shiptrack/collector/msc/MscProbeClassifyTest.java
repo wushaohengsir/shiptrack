@@ -11,11 +11,22 @@ class MscProbeClassifyTest {
 
     @Test
     void mapsHttpStatusBeforeWaitingForASelector() {
+        assertThat(MscProbe.statusError(401)).isEqualTo(AgentErrorCode.LOGIN_REQUIRED);
+        assertThat(MscProbe.statusError(403)).isEqualTo(AgentErrorCode.SOURCE_UNAVAILABLE);
         assertThat(MscProbe.statusError(429)).isEqualTo(AgentErrorCode.RATE_LIMITED);
         assertThat(MscProbe.statusError(500)).isEqualTo(AgentErrorCode.SOURCE_UNAVAILABLE);
         assertThat(MscProbe.statusError(503)).isEqualTo(AgentErrorCode.SOURCE_UNAVAILABLE);
         assertThat(MscProbe.statusError(200)).isNull();
         assertThat(MscProbe.statusError(404)).isNull();
+    }
+
+    @Test
+    void submitsWithTheTrackingFormButtonNotTheHeaderLogin() {
+        MscProperties properties = new MscProperties();
+        assertThat(properties.getSubmitSelector())
+                .isEqualTo(".msc-flow-tracking__form button.msc-search-autocomplete__search");
+        assertThat(properties.getLegacySubmitSelector())
+                .isEqualTo("button[type='submit'], button:has-text('Track')");
     }
 
     @Test
