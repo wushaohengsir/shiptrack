@@ -299,21 +299,36 @@ public class MscProbe implements MscTrackingClient {
                 }
             } else {
                 fallbackAny.set(signal);
-                if (signal.status() >= 400) {
+                // Only throttling (429) or an unavailable source (5xx) may back
+                // a query that rendered no error text. A background 401/403 is
+                // not evidence about this container, so it must never take the
+                // fallback slot and thereby erase an earlier 429/5xx (and the
+                // 429's Retry-After backoff).
+                if (signal.status() == 429 || signal.status() >= 500) {
                     fallbackError.set(signal);
                 }
             }
         };
         page.onResponse(responseListener);
         try {
+            Locator submit = submitLocator(page, input);
+            if (submit == null) {
+                return formFailure(deadline, run,
+                        "MSC tracking form has no trustworthy submit control");
+            }
             try {
-                submitLocator(page, input)
-                        .click(new Locator.ClickOptions().setTimeout(remainingMs(deadline)));
+                submit.click(new Locator.ClickOptions().setTimeout(remainingMs(deadline)));
             } catch (TimeoutError e) {
                 return formFailure(deadline, run, "MSC tracking form could not be filled or submitted");
             }
 
-            WaitOutcome wait = waitForResult(page, containerNo, deadline, correlated, beforeSubmit);
+            // Remember whether a block for this container was seen at any point
+            // during the wait, not just on the last poll: an old block can
+            // disappear before the result window closes, and that is a
+            // classified timeout, never a parse failure.
+            AtomicBoolean sawResultBlock = new AtomicBoolean();
+            WaitOutcome wait = waitForResult(page, containerNo, deadline, correlated,
+                    beforeSubmit, sawResultBlock);
             // Parse exactly the read that proved a fresh render. Re-reading the
             // block here would let the page change between the ownership check
             // and the parse, which is the staging window this fix closes.
@@ -367,7 +382,8 @@ public class MscProbe implements MscTrackingClient {
             // all during the wait (even if reading its text raced the budget),
             // this is a classified timeout, never a parse error.
             if (wait.result() != WaitResult.RESULT
-                    && (snapshot.resultBlockText() != null || wait.observation() != null)) {
+                    && (sawResultBlock.get() || snapshot.resultBlockText() != null
+                        || wait.observation() != null)) {
                 recordFailure(run);
                 return timeout("MSC result block was not refreshed for container " + containerNo);
             }
@@ -414,16 +430,28 @@ public class MscProbe implements MscTrackingClient {
                 return chosen;
             }
         }
-        // Nothing trustworthy: clicking this surfaces the usual timeout, which
-        // the caller reports as a form failure, rather than clicking a login.
-        return precise.first();
+        // Nothing trustworthy: returning null routes the caller to the form
+        // failure path. A control that cannot be proven to target the tracking
+        // form must never be clicked, because the precise selector can also
+        // match the header myMSC login button.
+        return null;
     }
 
+    /**
+     * The first candidate that can be proven to be a non-login tracking
+     * submit. A candidate whose tell cannot be read is treated as unconfirmed
+     * and skipped, never returned as a fallback.
+     */
     private static Locator firstNonLoginControl(Locator candidates) {
-        int count = Math.min(candidates.count(), MAX_SUBMIT_CANDIDATES);
+        int count;
+        try {
+            count = Math.min(candidates.count(), MAX_SUBMIT_CANDIDATES);
+        } catch (PlaywrightException e) {
+            return null;
+        }
         for (int i = 0; i < count; i++) {
             Locator candidate = candidates.nth(i);
-            if (!looksLikeLoginControl(candidate)) {
+            if (controlTrust(candidate) == ControlTrust.SAFE) {
                 return candidate;
             }
         }
@@ -442,35 +470,64 @@ public class MscProbe implements MscTrackingClient {
 
     /**
      * A submit control is a login control when its own text/class/href/aria
-     * label or its owning form's action points at the identity provider. This
-     * catches icon-only myMSC buttons whose only tell is the aria label or the
-     * outer form's action.
+     * label/formaction, or any form it can submit to (its own formaction, the
+     * form it is associated with, the nearest form ancestor) points at the
+     * identity provider. This catches icon-only myMSC buttons whose only tell
+     * is the aria label or the outer form's action, and buttons that override
+     * their form with a login {@code formaction}. An unreadable candidate is
+     * UNKNOWN: it is skipped rather than clicked.
      */
-    private static boolean looksLikeLoginControl(Locator candidate) {
+    private static ControlTrust controlTrust(Locator candidate) {
         try {
-            String text = candidate.innerText();
-            String className = candidate.getAttribute("class");
-            String href = candidate.getAttribute("href");
-            String ariaLabel = candidate.getAttribute("aria-label");
-            String formAction = candidate.evaluate(
-                    "el => { const f = el.form || (el.closest ? el.closest('form') : null);"
-                            + " return f ? f.getAttribute('action') : null; }") instanceof String action
-                    ? action
-                    : null;
-            String haystack = ((text == null ? "" : text) + " "
-                    + (className == null ? "" : className) + " "
-                    + (href == null ? "" : href) + " "
-                    + (ariaLabel == null ? "" : ariaLabel) + " "
-                    + (formAction == null ? "" : formAction)).toLowerCase(Locale.ROOT);
-            return haystack.contains("mymsc")
-                    || haystack.contains("login")
-                    || haystack.contains("log in")
-                    || haystack.contains("sign in")
-                    || haystack.contains("signin")
-                    || haystack.contains("identity");
+            StringBuilder haystack = new StringBuilder();
+            appendTell(haystack, candidate.innerText());
+            appendTell(haystack, candidate.getAttribute("class"));
+            appendTell(haystack, candidate.getAttribute("href"));
+            appendTell(haystack, candidate.getAttribute("aria-label"));
+            appendTell(haystack, candidate.getAttribute("formaction"));
+            Object targets = candidate.evaluate(
+                    "el => { const out = [];"
+                            + " const fa = el.getAttribute ? el.getAttribute('formaction') : null;"
+                            + " if (fa) out.push(fa);"
+                            + " const own = el.form ? el.form.getAttribute('action') : null;"
+                            + " if (own) out.push(own);"
+                            + " const near = el.closest ? el.closest('form') : null;"
+                            + " const na = near ? near.getAttribute('action') : null;"
+                            + " if (na) out.push(na);"
+                            + " return out.join(' '); }");
+            if (targets instanceof String s) {
+                appendTell(haystack, s);
+            }
+            return containsLoginCue(haystack.toString()) ? ControlTrust.LOGIN : ControlTrust.SAFE;
         } catch (PlaywrightException e) {
-            return false;
+            // We cannot prove what this control submits to; never click it.
+            return ControlTrust.UNKNOWN;
         }
+    }
+
+    private static void appendTell(StringBuilder haystack, String value) {
+        if (value != null && !value.isEmpty()) {
+            if (haystack.length() > 0) {
+                haystack.append(' ');
+            }
+            haystack.append(value);
+        }
+    }
+
+    private static boolean containsLoginCue(String haystack) {
+        String lower = haystack.toLowerCase(Locale.ROOT);
+        return lower.contains("mymsc")
+                || lower.contains("login")
+                || lower.contains("log in")
+                || lower.contains("sign in")
+                || lower.contains("signin")
+                || lower.contains("identity");
+    }
+
+    private enum ControlTrust {
+        SAFE,
+        LOGIN,
+        UNKNOWN
     }
 
     /**
@@ -481,6 +538,7 @@ public class MscProbe implements MscTrackingClient {
      */
     private void dismissConsent(Page page, long deadline) {
         List<String> selectors = properties.getConsentSelectors();
+        boolean attempted = false;
         if (selectors != null) {
             for (String selector : selectors) {
                 if (selector == null || selector.isBlank()) {
@@ -493,7 +551,7 @@ public class MscProbe implements MscTrackingClient {
                     }
                     long timeout = Math.min(5_000, Math.max(1, remainingMsOrZero(deadline)));
                     control.first().click(new Locator.ClickOptions().setTimeout(timeout));
-                    log.info("Dismissed the MSC cookie consent overlay");
+                    attempted = true;
                     break;
                 } catch (PlaywrightException e) {
                     log.debug("Cookie consent control {} was not clickable: {}",
@@ -508,16 +566,26 @@ public class MscProbe implements MscTrackingClient {
         } catch (PlaywrightException e) {
             log.debug("Could not clear a leftover consent overlay: {}", firstLine(e.getMessage()));
         }
+        // Log success only once every matching overlay is gone; a single
+        // leftover dark filter would still swallow the submit click.
         if (consentOverlayVisible(page)) {
             log.warn("MSC cookie consent overlay is still present; the submit click may be intercepted");
+        } else if (attempted) {
+            log.info("Dismissed the MSC cookie consent overlay");
         }
     }
 
     private static boolean consentOverlayVisible(Page page) {
         String selector = "#onetrust-consent-sdk, .onetrust-pc-dark-filter";
         try {
-            Locator overlay = page.locator(selector).first();
-            return overlay.count() > 0 && overlay.isVisible();
+            Locator overlays = page.locator(selector);
+            int count = overlays.count();
+            for (int i = 0; i < count; i++) {
+                if (overlays.nth(i).isVisible()) {
+                    return true;
+                }
+            }
+            return false;
         } catch (PlaywrightException e) {
             return false;
         }
@@ -557,14 +625,19 @@ public class MscProbe implements MscTrackingClient {
     }
 
     /**
+     * A real redirect hop. 304 is a cache validator, not a hop in a submit
+     * chain, so it must not be treated as a droppable intermediate response.
+     */
+    private static boolean isRedirect(int status) {
+        return status == 301 || status == 302 || status == 303
+                || status == 307 || status == 308;
+    }
+
+    /**
      * A non-correlated background failure may still evidence throttling or an
      * unavailable carrier (429/5xx), but never a login or an access denial that
      * is not tied to this query.
      */
-    private static boolean isRedirect(int status) {
-        return status >= 300 && status < 400;
-    }
-
     private static AgentErrorCode fallbackStatusError(int status) {
         if (status == 429) {
             return AgentErrorCode.RATE_LIMITED;
@@ -635,11 +708,15 @@ public class MscProbe implements MscTrackingClient {
      */
     private WaitOutcome waitForResult(Page page, String containerNo, long deadline,
                                       AtomicReference<SubmitResponse> correlated,
-                                      ResultBaseline beforeSubmit) {
+                                      ResultBaseline beforeSubmit, AtomicBoolean sawResultBlock) {
         long resultDeadline = Math.min(deadline,
                 System.nanoTime() + Math.max(0, properties.getResultWaitMs()) * 1_000_000L);
         while (true) {
             ResultObservation render = observeResult(page, containerNo, resultDeadline, beforeSubmit);
+            if (render != null) {
+                // Observed at any point in the wait, even if it later vanishes.
+                sawResultBlock.set(true);
+            }
             SubmitResponse response = correlated.get();
             if (response != null && response.status() >= 400) {
                 return new WaitOutcome(WaitResult.HTTP_ERROR, null);

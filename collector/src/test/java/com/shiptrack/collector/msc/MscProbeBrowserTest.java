@@ -833,6 +833,60 @@ class MscProbeBrowserTest {
         assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.CONTAINER_NOT_FOUND);
     }
 
+    // --- Boundary fixtures from the M5-D re-review (Codex v1.1) ---
+
+    @Test
+    void independentRejectedPreciseLoginMustNotBeClicked() {
+        configureReview("/independent-rejected-precise");
+        TrackingOutcome outcome = probe.query("MSDU7172233");
+        assertThat(localLoginHits.get()).as("header login requests; outcome %s", outcome).isZero();
+        assertThat(failure(outcome)).isEqualTo(AgentErrorCode.PARSE_ERROR);
+    }
+
+    @Test
+    void independentLegacySubmitMustCheckButtonActionOverride() {
+        configureReview("/independent-formaction");
+        TrackingOutcome outcome = probe.query("MSDU7172233");
+        assertThat(localLoginHits.get()).as("header login requests; outcome %s", outcome).isZero();
+        assertThat(failure(outcome)).isEqualTo(AgentErrorCode.PARSE_ERROR);
+    }
+
+    @Test
+    void independentBackground401MustNotEraseFallback429() {
+        configureReview("/independent-fallback-429");
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.RATE_LIMITED);
+    }
+
+    @Test
+    void independentBackground403MustNotEraseFallback500() {
+        configureReview("/independent-fallback-500");
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.SOURCE_UNAVAILABLE);
+    }
+
+    @Test
+    void independentCaptchaTakesPriorityOverCorrelated403() {
+        configureReview("/independent-captcha");
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.CAPTCHA_REQUIRED);
+    }
+
+    @Test
+    void independentPasswordFieldTakesPriorityOverCorrelated403() {
+        configureReview("/independent-password");
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.LOGIN_REQUIRED);
+    }
+
+    @Test
+    void independentCorrelated401OverridesGenericNoResult() {
+        configureReview("/independent-mixed-401");
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.LOGIN_REQUIRED);
+    }
+
+    @Test
+    void independentEphemeralOldResultRemainsATimeout() {
+        configureReview("/independent-ephemeral");
+        assertThat(failure(probe.query("MSDU7172233"))).isEqualTo(AgentErrorCode.TIMEOUT);
+    }
+
     private void configureReview(String path) {
         properties.setBaseUrl(baseUrl(path));
         properties.setQueryTimeoutMs(7_000);
@@ -869,6 +923,30 @@ class MscProbeBrowserTest {
 
     private void dispatch(HttpExchange exchange) throws IOException {
         switch (exchange.getRequestURI().getPath()) {
+            case "/independent-ephemeral" -> respond(exchange, 200,
+                    SUBMIT_FORM.formatted("setTimeout(() => document.getElementById('result').remove(), 700)")
+                            .replace("</body>", "<p>Tracking number: MSDU7172233</p>"
+                                    + "<div id='result'><div id='status'>"
+                                    + "Status: Loaded on vessel MSDU7172233</div></div></body>"));
+            case "/independent-rejected-precise" -> respond(exchange, 200,
+                    "<html><body>" + LOCAL_ICON_LOGIN.replace("<button ", "<button id='track' ")
+                    + "<form><input id='container'></form></body></html>");
+            case "/independent-formaction" -> respond(exchange, 200,
+                    "<html><body><form action='/track'><input id='container'>"
+                    + "<button type='submit' formaction='/identity/externallogin'>"
+                    + "Track</button></form></body></html>");
+            case "/independent-fallback-429" -> respond(exchange, 200,
+                    SUBMIT_FORM.formatted("fetch('/track-429').then(() => fetch('/review-banner'))"));
+            case "/independent-fallback-500" -> respond(exchange, 200,
+                    SUBMIT_FORM.formatted("fetch('/track-500').then(() => fetch('/review-banner-403'))"));
+            case "/independent-captcha" -> respond(exchange, 200,
+                    independentMixedResponse("/track-403", "document.body.append('Please verify you are human')"));
+            case "/independent-password" -> respond(exchange, 200,
+                    independentMixedResponse("/track-403", "var i=document.createElement('input');"
+                            + "i.type='password';document.body.appendChild(i)"));
+            case "/independent-mixed-401" -> respond(exchange, 200,
+                    independentMixedResponse("/track-401", "document.body.append('No tracking information')"));
+            case "/track-401" -> respond(exchange, 401, "unauthorized");
             case "/review-legacy" -> respond(exchange, 200, LOCAL_REVIEW_PAGE);
             case "/review-precise" -> respond(exchange, 200, LOCAL_PRECISE_REVIEW_PAGE);
             case "/identity/externallogin" -> {
@@ -939,6 +1017,12 @@ class MscProbeBrowserTest {
             }
             default -> respond(exchange, 404, "not found");
         }
+    }
+
+    private static String independentMixedResponse(String path, String signal) {
+        return SUBMIT_FORM.formatted("var c=document.getElementById('container').value;"
+                + "var req=new XMLHttpRequest();req.open('GET','" + path + "?container='+c,false);"
+                + "req.send();" + signal);
     }
 
     private static void redirect(HttpExchange exchange, String location) throws IOException {
